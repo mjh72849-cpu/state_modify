@@ -64,6 +64,9 @@ def load_config(path: Path) -> dict[str, Any]:
     unknown = set(stages) - set(TRAIN_RUNS)
     if unknown:
         raise ValueError(f"Unknown training stages: {sorted(unknown)}")
+    source_stage = config["inference"].get("source_stage", "full")
+    if source_stage not in TRAIN_RUNS:
+        raise ValueError(f"Unknown inference source_stage: {source_stage!r}")
     return config
 
 
@@ -222,7 +225,12 @@ def inference_command(config: dict[str, Any], args: argparse.Namespace) -> tuple
     settings = config["pipeline"]
     inference = config["inference"]
     python = resolve_repo_path(settings["python"])
-    run_dir = stage_run_dir("full", args) if args.run_suffix else resolve_repo_path(inference["run_dir"])
+    source_stage = inference.get("source_stage", "full")
+    run_dir = (
+        stage_run_dir(source_stage, args)
+        if args.run_suffix
+        else resolve_repo_path(inference["run_dir"])
+    )
     default_output = run_dir / "prediction.h5ad" if args.run_suffix else resolve_repo_path(inference["output"])
     output = resolve_repo_path(args.output) if args.output else default_output
     command = [
@@ -253,7 +261,12 @@ def packaging_command(
     settings = config["pipeline"]
     inference = config["inference"]
     python = resolve_repo_path(settings["python"])
-    run_dir = stage_run_dir("full", args) if args.run_suffix else resolve_repo_path(inference["run_dir"])
+    source_stage = inference.get("source_stage", "full")
+    run_dir = (
+        stage_run_dir(source_stage, args)
+        if args.run_suffix
+        else resolve_repo_path(inference["run_dir"])
+    )
     default_output = run_dir / "prediction.vcc" if args.run_suffix else resolve_repo_path(inference["vcc_output"])
     output = resolve_repo_path(args.vcc_output) if args.vcc_output else default_output
     command = [
@@ -269,21 +282,28 @@ def packaging_command(
 
 
 def extract_submission_id(output: str) -> str | None:
+    payloads: list[Any] = []
     try:
-        payload = json.loads(output)
+        payloads.append(json.loads(output))
     except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    for key in ("entry_id", "submission_id", "id"):
-        value = payload.get(key)
-        if value is not None:
-            return str(value)
-    for value in payload.values():
-        if isinstance(value, dict):
-            for key in ("entry_id", "submission_id", "id"):
-                if value.get(key) is not None:
-                    return str(value[key])
+        # With --wait, some CLI versions emit one JSON status object per line.
+        for line in output.splitlines():
+            try:
+                payloads.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    for payload in reversed(payloads):
+        if not isinstance(payload, dict):
+            continue
+        for key in ("entry_id", "submission_id", "id"):
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+        for value in payload.values():
+            if isinstance(value, dict):
+                for key in ("entry_id", "submission_id", "id"):
+                    if value.get(key) is not None:
+                        return str(value[key])
     return None
 
 
@@ -376,7 +396,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     if args.vcc_output:
                         vcc_output = resolve_repo_path(args.vcc_output)
                     elif args.run_suffix:
-                        vcc_output = stage_run_dir("full", args) / "prediction.vcc"
+                        source_stage = config["inference"].get("source_stage", "full")
+                        vcc_output = stage_run_dir(source_stage, args) / "prediction.vcc"
                     else:
                         vcc_output = resolve_repo_path(config["inference"]["vcc_output"])
                 submit(tracker, vcc_output, config, args)

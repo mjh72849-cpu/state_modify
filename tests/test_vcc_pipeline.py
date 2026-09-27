@@ -74,4 +74,22 @@ def test_smoke_inference_and_packaging_are_isolated(tmp_path, monkeypatch):
 def test_submission_id_parser_accepts_current_cli_shapes():
     assert pipeline.extract_submission_id('{"entry_id":"abc"}') == "abc"
     assert pipeline.extract_submission_id('{"submission":{"id":123}}') == "123"
+    assert pipeline.extract_submission_id('{"status":"uploading"}\n{"entry_id":"xyz"}') == "xyz"
     assert pipeline.extract_submission_id("not json") is None
+
+
+def test_warmup_submit_config_infers_from_warmup_best_checkpoint(tmp_path, monkeypatch):
+    run_dirs = {
+        "h1-loco-warmup": tmp_path / "warmup",
+        "h1-loco-joint": tmp_path / "joint",
+        "full": tmp_path / "full",
+    }
+    monkeypatch.setattr(pipeline, "TRAIN_RUNS", run_dirs)
+    config = pipeline.load_config(ROOT / "configs/vcc/vcc_warmup_submit.toml")
+    command, output = pipeline.inference_command(
+        config, arguments(run_suffix="_probe")
+    )
+    expected_run = tmp_path / "warmup_probe"
+    assert Path(command[command.index("--run-dir") + 1]) == expected_run
+    assert command[command.index("--checkpoint") + 1] == "best.ckpt"
+    assert output == expected_run / "prediction.h5ad"

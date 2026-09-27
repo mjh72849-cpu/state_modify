@@ -39,6 +39,38 @@ scripts/vcc_pipeline_ctl.sh status smoke_v1
 scripts/vcc_pipeline_ctl.sh tail smoke_v1
 ```
 
+## Detached training through automatic VCC submission
+
+For a warm-up probe that must keep running after the local computer disconnects,
+use the tmux launcher. It trains only Stage A, infers from that run's
+validation-selected `best.ckpt`, packages all 300 targets, submits through the
+official CLI, waits for terminal scoring status, and records the submission ID:
+
+```bash
+scripts/vcc_tmux_pipeline.sh start warmup_probe_v1 \
+  --profile warmup --gpu 2 \
+  --model-name state-warmup-probe-v1 \
+  --confirm-submit
+```
+
+Closing the SSH terminal or the local computer does not stop the remote tmux
+server. The remote host itself must remain powered on.
+
+```bash
+scripts/vcc_tmux_pipeline.sh status warmup_probe_v1
+scripts/vcc_tmux_pipeline.sh tail warmup_probe_v1
+scripts/vcc_tmux_pipeline.sh attach warmup_probe_v1
+```
+
+If the remote process or host is interrupted, restart with the same ID and
+`--resume`. Completed stages and artifacts are skipped; an incomplete training
+stage resumes from `last.ckpt`:
+
+```bash
+scripts/vcc_tmux_pipeline.sh start warmup_probe_v1 \
+  --profile warmup --gpu 2 --confirm-submit --resume
+```
+
 ## Production training and packaging
 
 Start in the background:

@@ -1,0 +1,27 @@
+[pipeline]
+gpu = "2"
+python = "external/state-env/bin/python"
+num_workers = 8
+batch_size = 1
+gradient_accumulation = 8
+
+[training]
+stages = ["h1-loco-warmup"]
+
+[inference]
+enabled = true
+source_stage = "h1-loco-warmup"
+run_dir = "runs/vcc_h1_loco_warmup"
+checkpoint = "best.ckpt"
+output = "runs/vcc_h1_loco_warmup/prediction.h5ad"
+vcc_output = "runs/vcc_h1_loco_warmup/prediction.vcc"
+scratch_dir = "runs/vcc_pack_scratch"
+cell_chunk_size = 256
+gene_chunk_size = 512
+pack = true
+
+[submission]
+model_name = "state-warmup-probe"
+description = "STATE panel-free decoder warm-up probe; Tahoe backbone frozen"
+wait = true
+poll_interval = 30.0

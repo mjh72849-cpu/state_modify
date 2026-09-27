@@ -11,6 +11,7 @@ stages = ["h1-loco-warmup", "h1-loco-joint", "full"]
 
 [inference]
 enabled = true
+source_stage = "full"
 run_dir = "runs/vcc_full"
 checkpoint = "final.ckpt"
 output = "runs/vcc_full/prediction.h5ad"
