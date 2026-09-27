@@ -18,3 +18,6 @@ mfu_kwargs:
     logging_interval: 10
     window_size: 2
 cumulative_flops_use_backward: true
+log_every_n_steps: 50
+enable_progress_bar: true
+console_log_every_n_steps: 0  # 0 disables concise console progress messages

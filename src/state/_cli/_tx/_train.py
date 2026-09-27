@@ -28,6 +28,7 @@ def run_tx_train(cfg: DictConfig):
 
     from ...tx.callbacks import (
         BatchSpeedMonitorCallback,
+        ConciseProgressCallback,
         CumulativeFLOPSCallback,
         GradNormCallback,
         ModelFLOPSUtilizationCallback,
@@ -221,6 +222,10 @@ def run_tx_train(cfg: DictConfig):
 
     callbacks = ckpt_callbacks + [batch_speed_monitor]
 
+    console_log_interval = cfg["training"].get("console_log_every_n_steps", 0)
+    if console_log_interval:
+        callbacks.append(ConciseProgressCallback(console_log_interval))
+
     # Track gradient norm only for state transition model
     if cfg["model"]["name"] == "state":
         callbacks.append(GradNormCallback())
@@ -284,6 +289,7 @@ def run_tx_train(cfg: DictConfig):
         gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
         accumulate_grad_batches=cfg["training"].get("gradient_accumulation_steps", 1),
         use_distributed_sampler=False,
+        enable_progress_bar=cfg["training"].get("enable_progress_bar", True),
     )
 
     # Align logging cadence with rolling MFU window (and W&B logging)

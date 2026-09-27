@@ -6,8 +6,15 @@ from ..models import PerturbationModel
 from .batch_speed_monitor import BatchSpeedMonitorCallback
 from .model_flops_utilization import ModelFLOPSUtilizationCallback
 from .cumulative_flops import CumulativeFLOPSCallback
+from .concise_progress import ConciseProgressCallback
 
-__all__ = ["PerturbationModel", "BatchSpeedMonitorCallback", "ModelFLOPSUtilizationCallback", "CumulativeFLOPSCallback"]
+__all__ = [
+    "PerturbationModel",
+    "BatchSpeedMonitorCallback",
+    "ModelFLOPSUtilizationCallback",
+    "CumulativeFLOPSCallback",
+    "ConciseProgressCallback",
+]
 
 
 class GradNormCallback(Callback):

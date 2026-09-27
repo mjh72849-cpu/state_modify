@@ -4,7 +4,28 @@ import pytest
 from state.tx.callbacks import model_flops_utilization as mfu
 from state.tx.callbacks.model_flops_utilization import ModelFLOPSUtilizationCallback
 from state.tx.callbacks.cumulative_flops import CumulativeFLOPSCallback
+from state.tx.callbacks.concise_progress import ConciseProgressCallback
 import torch
+
+
+def test_concise_progress_uses_optimizer_steps(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "state.tx.callbacks.concise_progress.rank_zero_info",
+        lambda message, *args: messages.append(message % args),
+    )
+    trainer = type("Trainer", (), {"global_step": 49, "max_steps": 200})()
+    callback = ConciseProgressCallback(logging_interval=50)
+    callback.on_train_start(trainer, None)
+
+    callback.on_train_batch_end(trainer, None, None, None, 999)
+    assert messages == []
+
+    trainer.global_step = 50
+    callback.on_train_batch_end(trainer, None, None, None, 1000)
+    callback.on_train_batch_end(trainer, None, None, None, 1001)
+    assert len(messages) == 1
+    assert "optimizer_step=50/200" in messages[0]
 
 
 class FakeTrainer:
