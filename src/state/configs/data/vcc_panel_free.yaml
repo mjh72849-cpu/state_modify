@@ -37,6 +37,13 @@ kwargs:
   decoder_target_sum: 10000
   decoder_seed: 42
   decoder_always_include: []
+  # For perturbed Sets, reserve 60% of the 1,024 supervised genes for the
+  # largest matched-control expression shifts; fill the remainder randomly.
+  # The perturbation target is independently forced into every sampled panel.
+  decoder_deg_fraction: 0.6
+  # Match cell-eval2's vcc2026 control-only low-expression filter. Selection
+  # uses DE-ranked log2FC; exact Wilcoxon/BH significance is an offline step.
+  decoder_deg_min_control_cpm: 5.0
   # Build a per-Set matched-control log1p(CP10K) baseline for residual decoding.
   decoder_control_residual: true
 

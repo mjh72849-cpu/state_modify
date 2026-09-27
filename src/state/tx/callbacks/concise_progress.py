@@ -33,11 +33,42 @@ class ConciseProgressCallback(Callback):
         rate = step / elapsed
         remaining = max(int(trainer.max_steps) - step, 0)
         eta_hours = remaining / max(rate, 1e-9) / 3600
+        metrics = trainer.callback_metrics
+
+        def scalar(name: str) -> float | None:
+            value = metrics.get(name)
+            if value is None:
+                return None
+            try:
+                return float(value.detach().cpu())
+            except AttributeError:
+                return float(value)
+
+        train_loss = scalar("train_loss")
+        decoder_loss = scalar("decoder_loss")
+        gradient_norm = scalar("train/gradient_norm")
+        decoder_weight = float(getattr(pl_module, "decoder_loss_weight", 1.0))
+        total_loss = (
+            train_loss + decoder_weight * decoder_loss
+            if train_loss is not None and decoder_loss is not None
+            else None
+        )
+
+        loss_text = ""
+        if train_loss is not None:
+            loss_text += f" train_loss={train_loss:.6f}"
+        if decoder_loss is not None:
+            loss_text += f" decoder_loss={decoder_loss:.6f}"
+        if total_loss is not None:
+            loss_text += f" total_loss={total_loss:.6f}"
+        if gradient_norm is not None:
+            loss_text += f" gradient_norm={gradient_norm:.4f}"
         rank_zero_info(
-            "TRAIN_PROGRESS optimizer_step=%d/%d optimizer_steps_per_second=%.4f eta_hours=%.2f",
+            "TRAIN_PROGRESS optimizer_step=%d/%d optimizer_steps_per_second=%.4f eta_hours=%.2f%s",
             step,
             int(trainer.max_steps),
             rate,
             eta_hours,
+            loss_text,
         )
         self._last_logged_step = step

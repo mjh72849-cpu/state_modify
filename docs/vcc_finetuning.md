@@ -35,8 +35,21 @@ is therefore never used as a zero target.
 
 For efficient training, group cells from the same dataset/context into each ST
 set and sample 512--2,048 genes per step. Include the perturbation target and a
-stable VCC anchor subset with `always_include`, then fill the remainder at
-random. Balance datasets and perturbations in the sampler.
+stable VCC anchor subset with `always_include`. The VCC configuration reserves
+60% of the 1,024-gene budget for genes with the largest absolute matched-control
+log2 fold changes and fills the remainder at random. The DE-ranked pool applies
+the vcc2026 scorer's control-only expression filter (>5 CPM). It is not an FDR
+significance call: exact Wilcoxon/BH DEG lists require an offline whole-group
+precomputation and must never be estimated from hidden VCC labels.
+
+This is a VCC-specific supervision extension, not the original STATE training
+recipe. The STATE repository uses differential genes in evaluation and uses
+HVGs/full expression for transition training. The target gene remains forced
+into the sampled panel for biological supervision but does not consume the 60%
+DE-ranked quota; cell-eval2 excludes each perturbation's own gene from all six
+vcc2026 metrics. The random 40% is retained because expression MSE is one of
+those six equally weighted metrics and because focusing exclusively on DE genes
+would leave the rest of the 18,533-gene panel poorly calibrated.
 
 The panel-free data module now enforces the first rule dynamically: the current
 Set's `pert_name` is included whenever that target is measured and has a protein

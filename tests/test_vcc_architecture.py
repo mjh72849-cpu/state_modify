@@ -567,6 +567,31 @@ def test_decoder_gene_sampling_always_includes_set_perturbation_target():
     assert names[selected[0]] == "TP53"
 
 
+def test_decoder_gene_sampling_reserves_de_ranked_fraction():
+    module = PanelFreePerturbationDataModule.__new__(PanelFreePerturbationDataModule)
+    module.max_decoder_genes = 10
+    module.decoder_deg_fraction = 0.6
+    module.decoder_generator = torch.Generator().manual_seed(9)
+    module.decoder_always_include = set()
+    module.decoder_fallback_gene_to_id = {}
+    names = [f"G{i}" for i in range(20)] + ["TP53"]
+    module.pert_onehot_map = {name: torch.ones(2) for name in names}
+    # TP53 is deliberately not one of the top expression-shift genes, so the
+    # result must contain 1 required target + 6 DE-ranked + 3 random genes.
+    scores = torch.arange(len(names), dtype=torch.float32)
+    scores[-1] = -1
+    selected = module._select_gene_indices(
+        names,
+        required_names={"TP53"},
+        differential_scores=scores,
+    )
+    assert len(selected) == 10
+    assert names[selected[0]] == "TP53"
+    assert {names[index] for index in selected[1:7]} == {
+        "G14", "G15", "G16", "G17", "G18", "G19"
+    }
+
+
 def test_transfer_optimizer_uses_separate_learning_rate_groups():
     model = nn.Module()
     model.backbone = nn.Linear(3, 3)

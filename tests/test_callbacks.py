@@ -14,18 +14,35 @@ def test_concise_progress_uses_optimizer_steps(monkeypatch):
         "state.tx.callbacks.concise_progress.rank_zero_info",
         lambda message, *args: messages.append(message % args),
     )
-    trainer = type("Trainer", (), {"global_step": 49, "max_steps": 200})()
+    trainer = type(
+        "Trainer",
+        (),
+        {
+            "global_step": 49,
+            "max_steps": 200,
+            "callback_metrics": {
+                "train_loss": torch.tensor(0.75),
+                "decoder_loss": torch.tensor(0.05),
+                "train/gradient_norm": torch.tensor(1.25),
+            },
+        },
+    )()
+    model = type("Model", (), {"decoder_loss_weight": 2.0})()
     callback = ConciseProgressCallback(logging_interval=50)
-    callback.on_train_start(trainer, None)
+    callback.on_train_start(trainer, model)
 
-    callback.on_train_batch_end(trainer, None, None, None, 999)
+    callback.on_train_batch_end(trainer, model, None, None, 999)
     assert messages == []
 
     trainer.global_step = 50
-    callback.on_train_batch_end(trainer, None, None, None, 1000)
-    callback.on_train_batch_end(trainer, None, None, None, 1001)
+    callback.on_train_batch_end(trainer, model, None, None, 1000)
+    callback.on_train_batch_end(trainer, model, None, None, 1001)
     assert len(messages) == 1
     assert "optimizer_step=50/200" in messages[0]
+    assert "train_loss=0.750000" in messages[0]
+    assert "decoder_loss=0.050000" in messages[0]
+    assert "total_loss=0.850000" in messages[0]
+    assert "gradient_norm=1.2500" in messages[0]
 
 
 class FakeTrainer:

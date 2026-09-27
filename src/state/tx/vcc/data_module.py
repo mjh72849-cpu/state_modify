@@ -40,6 +40,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         decoder_target_sum: float = 10_000.0,
         decoder_seed: int = 42,
         decoder_always_include: list[str] | None = None,
+        decoder_deg_fraction: float = 0.0,
+        decoder_deg_min_control_cpm: float = 5.0,
         decoder_fallback_gene_names_file: str | None = None,
         trainable_perturbation_names_file: str | None = None,
         decoder_control_residual: bool = False,
@@ -60,8 +62,14 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             raise ValueError("max_decoder_genes must be positive")
         if decoder_target_sum <= 0:
             raise ValueError("decoder_target_sum must be positive")
+        if not 0.0 <= decoder_deg_fraction <= 1.0:
+            raise ValueError("decoder_deg_fraction must be between 0 and 1")
+        if decoder_deg_min_control_cpm < 0:
+            raise ValueError("decoder_deg_min_control_cpm cannot be negative")
         self.max_decoder_genes = int(max_decoder_genes)
         self.decoder_target_sum = float(decoder_target_sum)
+        self.decoder_deg_fraction = float(decoder_deg_fraction)
+        self.decoder_deg_min_control_cpm = float(decoder_deg_min_control_cpm)
         self.pin_memory = bool(kwargs.get("pin_memory", True))
         self.decoder_generator = torch.Generator().manual_seed(decoder_seed)
         self.decoder_always_include = {
@@ -144,6 +152,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         names: list[str],
         *,
         required_names: set[str] | None = None,
+        differential_scores: torch.Tensor | None = None,
     ) -> list[int]:
         # pert_onehot_map is the complete semantic feature dictionary loaded by
         # cell-load from perturbation_features_file, not merely a one-hot map.
@@ -163,10 +172,46 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         if len(required) > self.max_decoder_genes:
             raise ValueError("decoder_always_include exceeds max_decoder_genes")
         required_set = set(required)
-        remaining = torch.tensor([index for index in valid if index not in required_set], dtype=torch.long)
+        remaining = [index for index in valid if index not in required_set]
         take = self.max_decoder_genes - len(required)
-        sampled = remaining[torch.randperm(len(remaining), generator=self.decoder_generator)[:take]].tolist()
-        return required + sampled
+
+        # Enrich decoder supervision for genes with the largest matched-control
+        # expression shifts. These are DE-ranked genes rather than genes called
+        # significant by a hypothesis test: using a rank keeps the requested
+        # fraction stable even for small perturbation groups.
+        deg_selected: list[int] = []
+        deg_fraction = float(getattr(self, "decoder_deg_fraction", 0.0))
+        if differential_scores is not None and deg_fraction > 0 and take > 0:
+            scores = torch.as_tensor(differential_scores, dtype=torch.float32).flatten()
+            if scores.numel() != len(names):
+                raise ValueError("differential_scores must align with the native gene panel")
+            deg_take = min(round(self.max_decoder_genes * deg_fraction), take, len(remaining))
+            if deg_take:
+                remaining_tensor = torch.tensor(remaining, dtype=torch.long)
+                candidate_scores = scores[remaining_tensor]
+                finite = torch.isfinite(candidate_scores)
+                deg_take = min(deg_take, int(finite.sum().item()))
+                if deg_take:
+                    eligible_indices = remaining_tensor[finite]
+                    eligible_scores = candidate_scores[finite]
+                    order = torch.topk(
+                        eligible_scores, k=deg_take, largest=True, sorted=True
+                    ).indices
+                    deg_selected = eligible_indices[order].tolist()
+
+        selected_set = required_set | set(deg_selected)
+        random_pool = torch.tensor(
+            [index for index in valid if index not in selected_set], dtype=torch.long
+        )
+        random_take = self.max_decoder_genes - len(required) - len(deg_selected)
+        sampled = (
+            random_pool[
+                torch.randperm(len(random_pool), generator=self.decoder_generator)[:random_take]
+            ].tolist()
+            if random_take
+            else []
+        )
+        return required + deg_selected + sampled
 
     def _panel_free_collate(self, samples: list[dict]) -> dict:
         if not samples:
@@ -224,17 +269,65 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                         ) from error
                 set_perturbation_ids.append(perturbation_id)
             required_names = set() if perturbation == control_perturbation else {perturbation}
-            indices = self._select_gene_indices(names, required_names=required_names)
-            index_tensor = torch.tensor(indices, dtype=torch.long)
-            selected_counts = raw_counts.index_select(-1, index_tensor)
-            # Normalize with the full native-panel library size, not the
-            # sampled subset's total.
+
+            # All normalization denominators use the complete native panel.
             totals = raw_counts.sum(dim=-1, keepdim=True)
             scale = torch.where(
                 totals > 0,
                 self.decoder_target_sum / totals,
                 torch.zeros_like(totals),
             )
+            if ctrl_raw_counts is not None:
+                ctrl_raw_counts = ctrl_raw_counts.float().clamp_min(0)
+                if self.is_log1p:
+                    ctrl_raw_counts = torch.expm1(ctrl_raw_counts).clamp_min(0)
+                ctrl_totals = ctrl_raw_counts.sum(dim=-1, keepdim=True)
+                ctrl_scale = torch.where(
+                    ctrl_totals > 0,
+                    self.decoder_target_sum / ctrl_totals,
+                    torch.zeros_like(ctrl_totals),
+                )
+            else:
+                ctrl_scale = None
+
+            differential_scores = None
+            if (
+                float(getattr(self, "decoder_deg_fraction", 0.0)) > 0
+                and perturbation != control_perturbation
+            ):
+                if ctrl_raw_counts is None or ctrl_scale is None:
+                    raise KeyError(
+                        "decoder_deg_fraction > 0 requires store_raw_basal=True "
+                        "so matched ctrl_cell_counts are available"
+                    )
+                # Mirror the vcc2026 DE table as closely as is practical in a
+                # streaming collator: rank by absolute log2 fold-change of
+                # arithmetic mean normalized counts, and use the scorer's
+                # control-only >5 CPM gene filter. Statistical significance
+                # itself requires a cached whole-group Wilcoxon/BH pass and is
+                # intentionally not approximated with a per-Set p-value here.
+                pert_mean = (raw_counts * scale).mean(dim=0)
+                ctrl_mean = (ctrl_raw_counts * ctrl_scale).mean(dim=0)
+                epsilon = self.decoder_target_sum * 1.0e-15  # 1e-9 at CPM=1e6
+                differential_scores = torch.abs(
+                    torch.log2((pert_mean + epsilon) / (ctrl_mean + epsilon))
+                )
+                min_control = (
+                    float(getattr(self, "decoder_deg_min_control_cpm", 5.0))
+                    * self.decoder_target_sum
+                    / 1_000_000.0
+                )
+                differential_scores = differential_scores.masked_fill(
+                    ctrl_mean <= min_control, float("-inf")
+                )
+
+            indices = self._select_gene_indices(
+                names,
+                required_names=required_names,
+                differential_scores=differential_scores,
+            )
+            index_tensor = torch.tensor(indices, dtype=torch.long)
+            selected_counts = raw_counts.index_select(-1, index_tensor)
             set_targets.append(torch.log1p(selected_counts * scale))
             if getattr(self, "decoder_control_residual", False):
                 if ctrl_raw_counts is None:
@@ -242,16 +335,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                         "decoder_control_residual=True requires store_raw_basal=True "
                         "so ctrl_cell_counts is available"
                     )
-                ctrl_raw_counts = ctrl_raw_counts.float().clamp_min(0)
-                if self.is_log1p:
-                    ctrl_raw_counts = torch.expm1(ctrl_raw_counts).clamp_min(0)
                 ctrl_selected = ctrl_raw_counts.index_select(-1, index_tensor)
-                ctrl_totals = ctrl_raw_counts.sum(dim=-1, keepdim=True)
-                ctrl_scale = torch.where(
-                    ctrl_totals > 0,
-                    self.decoder_target_sum / ctrl_totals,
-                    torch.zeros_like(ctrl_totals),
-                )
+                assert ctrl_scale is not None
                 set_baselines.append(torch.log1p(ctrl_selected * ctrl_scale).mean(dim=0))
             selected_names = [names[index] for index in indices]
             set_names.append(selected_names)
@@ -390,6 +475,10 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                 "decoder_target_sum": self.decoder_target_sum,
                 "decoder_seed": self.decoder_generator.initial_seed(),
                 "decoder_always_include": sorted(self.decoder_always_include),
+                "decoder_deg_fraction": float(getattr(self, "decoder_deg_fraction", 0.0)),
+                "decoder_deg_min_control_cpm": float(
+                    getattr(self, "decoder_deg_min_control_cpm", 5.0)
+                ),
                 "decoder_fallback_gene_names_file": self.decoder_fallback_gene_names_file,
                 "decoder_fallback_gene_names": list(self.decoder_fallback_gene_to_id),
                 "trainable_perturbation_names_file": self.trainable_perturbation_names_file,
