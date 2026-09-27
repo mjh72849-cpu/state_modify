@@ -1,0 +1,29 @@
+[pipeline]
+# A run-specific ID should normally be supplied with --pipeline-id.
+gpu = "0"
+python = "external/state-env/bin/python"
+num_workers = 8
+batch_size = 1
+gradient_accumulation = 8
+
+[training]
+stages = ["h1-loco-warmup", "h1-loco-joint", "full"]
+
+[inference]
+enabled = true
+run_dir = "runs/vcc_full"
+checkpoint = "final.ckpt"
+output = "runs/vcc_full/prediction.h5ad"
+vcc_output = "runs/vcc_full/prediction.vcc"
+scratch_dir = "runs/vcc_pack_scratch"
+cell_chunk_size = 256
+gene_chunk_size = 512
+pack = true
+
+[submission]
+# Submission is never automatic. The CLI additionally requires both
+# --submit and --confirm-submit.
+model_name = "state-vcc"
+description = "STATE ST-SE-Tahoe panel-free genetic perturbation model"
+wait = false
+poll_interval = 30.0

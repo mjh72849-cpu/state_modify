@@ -62,6 +62,7 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume an existing run from checkpoints/last.ckpt")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -83,16 +84,20 @@ def main() -> None:
             f"Initialization checkpoint does not exist: {init_from}. "
             "Finish the preceding stage or pass --init-from explicitly."
         )
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
     if args.batch_size <= 0 or args.gradient_accumulation <= 0 or args.num_workers < 0:
         raise ValueError("batch size/accumulation must be positive and workers cannot be negative")
 
     name = args.name or profile["name"]
     max_steps = args.max_steps or profile["steps"]
     run_dir = ROOT / "runs" / name
-    if run_dir.exists() and not args.overwrite:
+    if run_dir.exists() and not (args.overwrite or args.resume):
         raise FileExistsError(
-            f"Run directory already exists: {run_dir}. Choose --name or explicitly pass --overwrite."
+            f"Run directory already exists: {run_dir}. Choose --name, --resume, or explicitly pass --overwrite."
         )
+    if args.resume and not (run_dir / "checkpoints/last.ckpt").is_file():
+        raise FileNotFoundError(f"Cannot resume without {run_dir / 'checkpoints/last.ckpt'}")
     command = [
         str(STATE), "tx", "train",
         "data=vcc_panel_free",

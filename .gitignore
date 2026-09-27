@@ -22,3 +22,5 @@ temp
 /external/state-env
 /external/ST-SE-Tahoe/**/*.ckpt
 /reports/
+/logs/*
+!/logs/README.md
