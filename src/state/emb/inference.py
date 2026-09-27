@@ -75,14 +75,16 @@ class Inference:
                     for _, obj in input_h5f.items():
                         input_h5f.copy(obj, output_h5f)
                     output_h5f.create_dataset(
-                        f"/obsm/{obsm_key}", chunks=True, data=data, maxshape=(None, data.shape[1])
+                        f"/obsm/{obsm_key}", chunks=True, compression="gzip",
+                        data=data, maxshape=(None, data.shape[1])
                     )
         else:
             with h5.File(output_adata_path, "a") as output_h5f:
                 # If the dataset is added to an existing file that does not have the dataset
                 if f"/obsm/{obsm_key}" not in output_h5f:
                     output_h5f.create_dataset(
-                        f"/obsm/{obsm_key}", chunks=True, data=data, maxshape=(None, data.shape[1])
+                        f"/obsm/{obsm_key}", chunks=True, compression="gzip",
+                        data=data, maxshape=(None, data.shape[1])
                     )
                 else:
                     output_h5f[f"/obsm/{obsm_key}"].resize(
@@ -255,8 +257,10 @@ class Inference:
 
         # if output_adata_path is provided, write the adata to the file
         if output_adata_path is not None:
-            adata.obsm[emb_key] = all_embeddings
-            adata.write_h5ad(output_adata_path)
+            # Preserve the input H5AD's compressed sparse count matrix byte-for-byte
+            # and append only X_state. Re-serializing AnnData can inflate large raw
+            # matrices by several GB per dataset.
+            self._save_data(input_adata_path, output_adata_path, emb_key, all_embeddings)
 
         # Save to lancedb, if requested
         if lancedb_path is not None:

@@ -160,6 +160,14 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
     module_config["gene_names"] = var_dims["gene_names"]
     module_config["batch_size"] = training_config["batch_size"]
     module_config["control_pert"] = data_config.get("control_pert", "non-targeting")
+    module_config.setdefault(
+        "num_trainable_perturbations",
+        var_dims.get("num_trainable_perturbations", 0),
+    )
+    module_config.setdefault(
+        "trainable_perturbation_names",
+        var_dims.get("trainable_perturbation_names", []),
+    )
 
     if data_config["output_space"] == "gene":
         gene_dim = var_dims["hvg_dim"]

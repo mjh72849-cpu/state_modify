@@ -1,0 +1,18 @@
+[datasets]
+arc_h1_train = "/sde/vcc/vcc2026/state/data/prepared/focused/arc_h1_train.focused.xstate.h5ad"
+replogle_k562_gwps = "/sde/vcc/vcc2026/state/data/prepared/focused/replogle_k562_gwps.focused.xstate.h5ad"
+xatlas_hct116 = "/sde/vcc/vcc2026/state/data/prepared/focused/xatlas_hct116.focused.xstate.h5ad"
+xatlas_hek293t = "/sde/vcc/vcc2026/state/data/prepared/hek293t/xatlas_hek293t.focused.xstate.h5ad"
+
+[training]
+arc_h1_train = "train"
+replogle_k562_gwps = "train"
+xatlas_hct116 = "train"
+xatlas_hek293t = "train"
+
+# Hold out all H1 perturbed cells while retaining H1 controls as available
+# basal cells. This matches the VCC unseen-context-with-controls setting.
+[zeroshot]
+"arc_h1_train.H1" = "val"
+
+[fewshot]

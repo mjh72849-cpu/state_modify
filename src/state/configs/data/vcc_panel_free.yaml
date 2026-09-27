@@ -1,0 +1,53 @@
+name: PanelFreePerturbationDataModule
+kwargs:
+  # Point this at directories containing standardized, QC'd files with
+  # obsm/X_state. The linked source files in data/raw are not ready yet.
+  toml_config_path: null
+  embed_key: X_state
+  output_space: all
+  pert_rep: onehot
+  basal_rep: sample
+  num_workers: 12
+  pin_memory: true
+  n_basal_samples: 1
+  basal_mapping_strategy: batch
+  should_yield_control_cells: true
+  batch_col: batch
+  pert_col: target_gene
+  cell_type_key: cell_type
+  control_pert: non-targeting
+  map_controls: true
+  perturbation_features_file: external/SE-600M/protein_embeddings.pt
+  # Stable IDs for a learned per-target residual. This registry is the sorted
+  # union of non-control targets in the focused H1/K562/HCT116/HEK293T data.
+  trainable_perturbation_names_file: assets/vcc_trainable_perturbations.txt
+  # Only these VCC-required genes may bypass a missing SE protein embedding.
+  # Other datasets' remaining out-of-vocabulary genes are still filtered.
+  decoder_fallback_gene_names_file: assets/vcc_2026_se_fallback_genes.txt
+  store_raw_basal: true
+  is_log1p: false
+  barcode: true
+  use_consecutive_loading: false
+  # Capped target/batch groups may be smaller than one Set; preserve them and
+  # let cell-load sample with replacement to fill cell_sentence_len.
+  drop_last: false
+  val_subsample_fraction: 1.0
+
+  max_decoder_genes: 1024
+  decoder_target_sum: 10000
+  decoder_seed: 42
+  decoder_always_include: []
+  # Build a per-Set matched-control log1p(CP10K) baseline for residual decoding.
+  decoder_control_residual: true
+
+  # Balance at the Set level. Each selected Set still contains cells from one
+  # (dataset, batch, cell type, perturbation) group only.
+  balance_datasets: true
+  balance_perturbations: true
+  sets_per_dataset_per_epoch: 2048
+  # Validation is a deterministic balanced proxy rather than all thousands of
+  # tiny (batch, perturbation) groups in the held-out context.
+  validation_sets_per_dataset: 256
+  # In LOCO, held-out-context controls remain available but must not receive a
+  # full balanced dataset share of control->control training Sets.
+  control_only_sets_per_epoch: 64

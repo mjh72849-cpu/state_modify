@@ -9,6 +9,7 @@ from lightning.pytorch import LightningModule
 import typing as tp
 
 from .utils import get_loss_fn
+from .decoders import PanelFreeGeneDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +151,12 @@ class PerturbationModel(ABC, LightningModule):
         gene_dim: int = 5000,
         hvg_dim: int = 2001,
         decoder_cfg: dict | None = None,
+        panel_free_decoder_cfg: dict | None = None,
         **kwargs,
     ):
         super().__init__()
         self.decoder_cfg = decoder_cfg
+        self.panel_free_decoder_cfg = panel_free_decoder_cfg
         self.save_hyperparameters()
         self.gene_decoder_bool = kwargs.get("gene_decoder_bool", True)
 
@@ -191,6 +194,8 @@ class PerturbationModel(ABC, LightningModule):
         self.gene_names = gene_names  # store the gene names that this model output for gene expression space
         self.dropout = dropout
         self.lr = lr
+        self.optimizer_group_lrs = kwargs.get("optimizer_group_lrs")
+        self.optimizer_weight_decay = float(kwargs.get("optimizer_weight_decay", 0.0))
         self.loss_fn = get_loss_fn(loss_fn)
 
         if self.output_space == "embedding":
@@ -243,6 +248,11 @@ class PerturbationModel(ABC, LightningModule):
 
     def _build_decoder(self):
         """Create self.gene_decoder from self.decoder_cfg (or leave None)."""
+        if self.panel_free_decoder_cfg is not None:
+            cfg = dict(self.panel_free_decoder_cfg)
+            cfg.setdefault("latent_dim", self.output_dim)
+            self.gene_decoder = PanelFreeGeneDecoder(**cfg)
+            return
         if self.gene_decoder_bool == False:
             self.gene_decoder = None
             return
@@ -261,6 +271,14 @@ class PerturbationModel(ABC, LightningModule):
         decoder_already_configured = (
             hasattr(self, "_decoder_externally_configured") and self._decoder_externally_configured
         )
+
+        if self.panel_free_decoder_cfg is not None:
+            # This decoder is panel independent and is configured by the new run,
+            # not reconstructed from the fixed-panel decoder metadata in a Tahoe
+            # checkpoint.
+            self._build_decoder()
+            logger.info("Panel-free gene decoder active; ignoring fixed-panel checkpoint decoder metadata")
+            return
 
         if self.gene_decoder_bool == False:
             self.gene_decoder = None
@@ -435,9 +453,46 @@ class PerturbationModel(ABC, LightningModule):
         return None
 
     def configure_optimizers(self):
-        """
-        Configure a single optimizer for both the main model and the gene decoder.
-        """
-        # Use a single optimizer for all parameters
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+        """Configure Adam, optionally with transfer-learning parameter groups."""
+        if not self.optimizer_group_lrs:
+            return torch.optim.Adam(
+                (parameter for parameter in self.parameters() if parameter.requires_grad),
+                lr=self.lr,
+                weight_decay=self.optimizer_weight_decay,
+            )
+
+        rates = dict(self.optimizer_group_lrs)
+        allowed = {"backbone", "perturbation_encoder", "decoder", "fallback"}
+        unknown = set(rates) - allowed
+        if unknown:
+            raise ValueError(f"Unknown optimizer group names: {sorted(unknown)}")
+        missing = allowed - set(rates)
+        if missing:
+            raise ValueError(f"optimizer_group_lrs is missing groups: {sorted(missing)}")
+
+        grouped: dict[str, list[torch.nn.Parameter]] = {name: [] for name in allowed}
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith("gene_decoder.fallback_"):
+                group = "fallback"
+            elif name.startswith("gene_decoder."):
+                group = "decoder"
+            elif name.startswith("pert_encoder.") or name.startswith("perturbation_residual."):
+                group = "perturbation_encoder"
+            else:
+                group = "backbone"
+            grouped[group].append(parameter)
+
+        parameter_groups = [
+            {
+                "params": grouped[name],
+                "lr": float(rates[name]),
+                "name": name,
+            }
+            for name in ("backbone", "perturbation_encoder", "decoder", "fallback")
+            if grouped[name]
+        ]
+        if not parameter_groups:
+            raise ValueError("No trainable parameters remain after applying freeze settings")
+        return torch.optim.Adam(parameter_groups, weight_decay=self.optimizer_weight_decay)

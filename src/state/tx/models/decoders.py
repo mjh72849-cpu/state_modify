@@ -12,6 +12,230 @@ from ...emb.finetune_decoder import Finetune
 logger = logging.getLogger(__name__)
 
 
+class PanelFreeGeneDecoder(nn.Module):
+    """Decode arbitrary genes from a cell-state embedding.
+
+    Unlike :class:`LatentToGeneDecoder` and the legacy VCI decoder below, the
+    output head does not depend on the size or ordering of the queried panel.
+    The optional fallback registry has one residual per explicitly configured
+    missing gene. Genes to query are supplied at every forward call.
+
+    ``gene_embeddings`` may be shared by all cells (``[G, E]``), supplied per
+    cell set (``[B, G, E]``), or supplied per cell (``[B, S, G, E]``).  The
+    last form is useful when a batch contains datasets with different measured
+    panels.  Genes can be evaluated in chunks to keep inference over the VCC
+    18,533-gene panel memory bounded.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        gene_embedding_dim: int,
+        hidden_dim: int = 256,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        output_activation: str = "softplus",
+        num_fallback_genes: int = 0,
+        fusion_mode: str = "add",
+        use_gene_baseline: bool = False,
+        predict_residual: bool = False,
+    ):
+        super().__init__()
+        if n_layers < 1:
+            raise ValueError("n_layers must be at least 1")
+        if output_activation not in {"identity", "relu", "softplus"}:
+            raise ValueError("output_activation must be one of: identity, relu, softplus")
+        if fusion_mode not in {"add", "concat"}:
+            raise ValueError("fusion_mode must be one of: add, concat")
+        if use_gene_baseline and fusion_mode != "concat":
+            raise ValueError("use_gene_baseline requires fusion_mode='concat'")
+        if predict_residual and not use_gene_baseline:
+            raise ValueError("predict_residual requires use_gene_baseline=True")
+
+        self.latent_dim = int(latent_dim)
+        self.gene_embedding_dim = int(gene_embedding_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.output_activation = output_activation
+        self.num_fallback_genes = int(num_fallback_genes)
+        self.fusion_mode = fusion_mode
+        self.use_gene_baseline = bool(use_gene_baseline)
+        self.predict_residual = bool(predict_residual)
+        if self.num_fallback_genes < 0:
+            raise ValueError("num_fallback_genes cannot be negative")
+
+        self.cell_projection = nn.Linear(self.latent_dim, self.hidden_dim)
+        self.gene_projection = nn.Linear(self.gene_embedding_dim, self.hidden_dim)
+        if self.num_fallback_genes:
+            # Learn missing genes in projected decoder space instead of
+            # fabricating protein-language-model vectors.
+            self.fallback_base = nn.Parameter(torch.zeros(self.hidden_dim))
+            self.fallback_residual = nn.Embedding(self.num_fallback_genes, self.hidden_dim)
+            nn.init.normal_(self.fallback_residual.weight, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("fallback_base", None)
+            self.fallback_residual = None
+
+        head_dim = self.hidden_dim if fusion_mode == "add" else 2 * self.hidden_dim
+        if self.use_gene_baseline:
+            head_dim += 1
+        layers = []
+        for _ in range(n_layers - 1):
+            layers.extend(
+                [
+                    nn.LayerNorm(head_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(head_dim, self.hidden_dim),
+                ]
+            )
+            head_dim = self.hidden_dim
+        layers.extend([nn.LayerNorm(head_dim), nn.GELU(), nn.Linear(head_dim, 1)])
+        self.shared_head = nn.Sequential(*layers)
+
+    def gene_dim(self):
+        """A panel-free decoder has no fixed output dimension."""
+        return None
+
+    @staticmethod
+    def _expand_gene_embeddings(gene_embeddings: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = latent.shape
+        if gene_embeddings.dim() == 2:
+            return gene_embeddings[None, None].expand(batch_size, seq_len, -1, -1)
+        if gene_embeddings.dim() == 3:
+            if gene_embeddings.shape[0] == batch_size:
+                return gene_embeddings[:, None].expand(-1, seq_len, -1, -1)
+            if gene_embeddings.shape[0] == batch_size * seq_len:
+                return gene_embeddings.reshape(batch_size, seq_len, *gene_embeddings.shape[1:])
+        if gene_embeddings.dim() == 4 and gene_embeddings.shape[:2] == (batch_size, seq_len):
+            return gene_embeddings
+        raise ValueError(
+            "gene_embeddings must have shape [G,E], [B,G,E], [B*S,G,E], or [B,S,G,E] "
+            f"for latent shape {tuple(latent.shape)}; got {tuple(gene_embeddings.shape)}"
+        )
+
+    @staticmethod
+    def _expand_fallback_ids(
+        fallback_ids: torch.Tensor,
+        latent: torch.Tensor,
+        n_genes: int,
+    ) -> torch.Tensor:
+        """Broadcast stable fallback IDs to ``[B,S,G]``; ``-1`` means pretrained."""
+        batch_size, seq_len, _ = latent.shape
+        if fallback_ids.dim() == 1 and fallback_ids.shape[0] == n_genes:
+            return fallback_ids[None, None].expand(batch_size, seq_len, -1)
+        if fallback_ids.dim() == 2:
+            if fallback_ids.shape == (batch_size, n_genes):
+                return fallback_ids[:, None].expand(-1, seq_len, -1)
+            if fallback_ids.shape == (batch_size * seq_len, n_genes):
+                return fallback_ids.reshape(batch_size, seq_len, n_genes)
+        if fallback_ids.dim() == 3 and fallback_ids.shape == (batch_size, seq_len, n_genes):
+            return fallback_ids
+        raise ValueError(
+            "fallback_ids must have shape [G], [B,G], [B*S,G], or [B,S,G] "
+            f"for latent shape {tuple(latent.shape)} and G={n_genes}; got {tuple(fallback_ids.shape)}"
+        )
+
+    def _activate(self, value: torch.Tensor) -> torch.Tensor:
+        if self.output_activation == "softplus":
+            return torch.nn.functional.softplus(value)
+        if self.output_activation == "relu":
+            return torch.relu(value)
+        return value
+
+    @staticmethod
+    def _expand_gene_baseline(
+        gene_baseline: torch.Tensor, latent: torch.Tensor, n_genes: int
+    ) -> torch.Tensor:
+        """Broadcast a control-expression baseline to ``[B,S,G]``."""
+        batch_size, seq_len, _ = latent.shape
+        if gene_baseline.dim() == 1 and gene_baseline.shape[0] == n_genes:
+            return gene_baseline[None, None].expand(batch_size, seq_len, -1)
+        if gene_baseline.dim() == 2:
+            if gene_baseline.shape == (batch_size, n_genes):
+                return gene_baseline[:, None].expand(-1, seq_len, -1)
+            if gene_baseline.shape == (batch_size * seq_len, n_genes):
+                return gene_baseline.reshape(batch_size, seq_len, n_genes)
+        if gene_baseline.dim() == 3 and gene_baseline.shape == (batch_size, seq_len, n_genes):
+            return gene_baseline
+        raise ValueError(
+            "gene_baseline must have shape [G], [B,G], [B*S,G], or [B,S,G] "
+            f"for latent shape {tuple(latent.shape)} and G={n_genes}; got {tuple(gene_baseline.shape)}"
+        )
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        gene_embeddings: torch.Tensor,
+        *,
+        fallback_ids: Optional[torch.Tensor] = None,
+        gene_baseline: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Return expression with shape ``[B, S, G]``."""
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        if latent.dim() != 3:
+            raise ValueError(f"latent must have shape [B,S,D] or [S,D], got {tuple(latent.shape)}")
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(f"Expected latent_dim={self.latent_dim}, got {latent.shape[-1]}")
+
+        genes = self._expand_gene_embeddings(gene_embeddings, latent)
+        if genes.shape[-1] != self.gene_embedding_dim:
+            raise ValueError(f"Expected gene_embedding_dim={self.gene_embedding_dim}, got {genes.shape[-1]}")
+
+        n_genes = genes.shape[-2]
+        if n_genes == 0:
+            return latent.new_empty((*latent.shape[:2], 0))
+        chunk_size = n_genes if chunk_size is None else int(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+
+        cell_features = self.cell_projection(latent).unsqueeze(-2)
+        expanded_baseline = None
+        if self.use_gene_baseline:
+            if gene_baseline is None:
+                raise ValueError("gene_baseline is required when use_gene_baseline=True")
+            expanded_baseline = self._expand_gene_baseline(
+                gene_baseline.to(device=latent.device, dtype=latent.dtype), latent, n_genes
+            )
+        expanded_fallback_ids = None
+        if fallback_ids is not None:
+            expanded_fallback_ids = self._expand_fallback_ids(
+                fallback_ids.to(latent.device), latent, n_genes
+            ).long()
+            active = expanded_fallback_ids >= 0
+            if active.any():
+                if self.fallback_residual is None or self.fallback_base is None:
+                    raise ValueError("fallback_ids contain active IDs but num_fallback_genes=0")
+                largest_id = int(expanded_fallback_ids[active].max().item())
+                if largest_id >= self.num_fallback_genes:
+                    raise ValueError(
+                        f"fallback ID {largest_id} is outside configured range [0, {self.num_fallback_genes})"
+                    )
+        outputs = []
+        for start in range(0, n_genes, chunk_size):
+            gene_features = self.gene_projection(genes[..., start : start + chunk_size, :])
+            if expanded_fallback_ids is not None:
+                ids = expanded_fallback_ids[..., start : start + chunk_size]
+                active = ids >= 0
+                if active.any():
+                    learned = self.fallback_base + self.fallback_residual(ids.clamp_min(0))
+                    gene_features = torch.where(active.unsqueeze(-1), learned, gene_features)
+            if self.fusion_mode == "add":
+                fused = cell_features + gene_features
+            else:
+                expanded_cells = cell_features.expand(*gene_features.shape[:-1], -1)
+                parts = [expanded_cells, gene_features]
+                if expanded_baseline is not None:
+                    parts.append(expanded_baseline[..., start : start + chunk_size, None])
+                fused = torch.cat(parts, dim=-1)
+            values = self.shared_head(fused).squeeze(-1)
+            if self.predict_residual:
+                values = values + expanded_baseline[..., start : start + chunk_size]
+            outputs.append(self._activate(values))
+        return torch.cat(outputs, dim=-1)
+
+
 class FinetuneVCICountsDecoder(nn.Module):
     def __init__(
         self,

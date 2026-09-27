@@ -12,3 +12,13 @@ notebooks/
 *.slurm
 temp
 /wandb/
+/data/prepared/*
+!/data/prepared/.gitkeep
+/data/raw
+/data/vcc_2026_controls
+/runs/*
+!/runs/.gitkeep
+/external/SE-600M
+/external/state-env
+/external/ST-SE-Tahoe/**/*.ckpt
+/reports/

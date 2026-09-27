@@ -113,16 +113,25 @@ def run_tx_train(cfg: DictConfig):
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
 
-    data_module: PerturbationDataModule = get_datamodule(
-        cfg["data"]["name"],
-        cfg["data"]["kwargs"],
-        batch_size=cfg["training"]["batch_size"],
-        cell_sentence_len=sentence_len,
-    )
+    if cfg["data"]["name"] == "PanelFreePerturbationDataModule":
+        from ...tx.vcc.data_module import PanelFreePerturbationDataModule
 
-    with open(join(run_output_dir, "data_module.torch"), "wb") as f:
-        # TODO-Abhi: only save necessary data
-        data_module.save_state(f)
+        panel_kwargs = cfg["data"]["kwargs"]
+        panel_kwargs["batch_size"] = cfg["training"]["batch_size"]
+        panel_kwargs["cell_sentence_len"] = sentence_len
+        data_module = PanelFreePerturbationDataModule(**panel_kwargs)
+    else:
+        data_module: PerturbationDataModule = get_datamodule(
+            cfg["data"]["name"],
+            cfg["data"]["kwargs"],
+            batch_size=cfg["training"]["batch_size"],
+            cell_sentence_len=sentence_len,
+        )
+
+    # ``PerturbationDataModule.save_state`` documents a filesystem path.  Pass
+    # that path through instead of a write-only handle so subclasses can load
+    # and extend the compact state dictionary before persisting it.
+    data_module.save_state(join(run_output_dir, "data_module.torch"))
 
     data_module.setup(stage="fit")
     dl = data_module.train_dataloader()

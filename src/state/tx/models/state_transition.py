@@ -11,7 +11,7 @@ from geomloss import SamplesLoss
 from typing import Dict, Optional, Tuple
 
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder
+from .decoders import FinetuneVCICountsDecoder, PanelFreeGeneDecoder
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
 
@@ -119,6 +119,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         transformer_backbone_kwargs: dict = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
+        num_trainable_perturbations: int = 0,
+        trainable_perturbation_names: list[str] | None = None,
         **kwargs,
     ):
         """
@@ -141,6 +143,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pert_dim=pert_dim,
             batch_dim=batch_dim,
             output_space=output_space,
+            num_trainable_perturbations=num_trainable_perturbations,
+            trainable_perturbation_names=trainable_perturbation_names,
             **kwargs,
         )
 
@@ -184,6 +188,31 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
+
+        # Preserve the semantic protein prior while giving every observed
+        # genetic perturbation its own trainable identity. Zero initialization
+        # makes checkpoint transfer behavior identical before the first update.
+        self.num_trainable_perturbations = int(num_trainable_perturbations)
+        if self.num_trainable_perturbations < 0:
+            raise ValueError("num_trainable_perturbations cannot be negative")
+        self.trainable_perturbation_names = list(trainable_perturbation_names or [])
+        if self.trainable_perturbation_names and (
+            len(self.trainable_perturbation_names) != self.num_trainable_perturbations
+        ):
+            raise ValueError(
+                "trainable_perturbation_names length must equal num_trainable_perturbations"
+            )
+        if len(self.trainable_perturbation_names) != len(set(self.trainable_perturbation_names)):
+            raise ValueError("trainable_perturbation_names contains duplicates")
+        self.trainable_perturbation_to_id = {
+            name: index for index, name in enumerate(self.trainable_perturbation_names)
+        }
+        self.perturbation_residual = None
+        if self.num_trainable_perturbations:
+            self.perturbation_residual = nn.Embedding(
+                self.num_trainable_perturbations, self.hidden_dim
+            )
+            nn.init.zeros_(self.perturbation_residual.weight)
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -306,7 +335,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
             for param in self.project_out.parameters():
                 param.requires_grad = False
 
+        # Warm-up mode for transfer learning: train only the newly initialized
+        # target-gene encoder, panel-free decoder, and fallback parameters.
+        self.freeze_pretrained_backbone = bool(kwargs.get("freeze_pretrained_backbone", False))
+        if self.freeze_pretrained_backbone:
+            for module in (self.basal_encoder, self.transformer_backbone, self.project_out):
+                for param in module.parameters():
+                    param.requires_grad = False
+
         control_pert = kwargs.get("control_pert", "non-targeting")
+        if kwargs.get("finetune_vci_decoder", False) and self.panel_free_decoder_cfg is not None:
+            raise ValueError("finetune_vci_decoder and panel_free_decoder_cfg are mutually exclusive")
         if kwargs.get("finetune_vci_decoder", False):  # TODO: This will go very soon
             # Prefer the gene names supplied by the data module (aligned to training output)
             gene_names = self.gene_names
@@ -385,9 +424,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
-    def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
-        """If needed, define how we embed the raw perturbation input."""
-        return self.pert_encoder(pert)
+    def encode_perturbation(
+        self,
+        pert: torch.Tensor,
+        perturbation_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Combine the semantic encoding with an optional learned target residual.
+
+        ``-1`` is reserved for control and contributes exactly zero. Non-control
+        IDs are stable rows in the registry emitted by the data preparation
+        pipeline, so targets never collapse merely because names differ.
+        """
+        encoded = self.pert_encoder(pert)
+        residual_table = getattr(self, "perturbation_residual", None)
+        if residual_table is None:
+            return encoded
+        if perturbation_ids is None:
+            raise KeyError(
+                "This model has a trainable perturbation table but batch['perturbation_ids'] is missing"
+            )
+        perturbation_ids = perturbation_ids.to(device=encoded.device, dtype=torch.long)
+        if perturbation_ids.shape != encoded.shape[:-1]:
+            raise ValueError(
+                f"perturbation_ids shape {tuple(perturbation_ids.shape)} does not match "
+                f"perturbation tokens {tuple(encoded.shape[:-1])}"
+            )
+        active = perturbation_ids >= 0
+        if active.any() and perturbation_ids[active].max() >= residual_table.num_embeddings:
+            raise IndexError("perturbation ID is outside the trainable perturbation registry")
+        safe_ids = perturbation_ids.clamp_min(0)
+        residual = residual_table(safe_ids)
+        residual = residual * active.unsqueeze(-1).to(residual.dtype)
+        return encoded + residual
 
     def encode_basal_expression(self, expr: torch.Tensor) -> torch.Tensor:
         """Define how we embed basal state input, if needed."""
@@ -409,13 +477,19 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if padded:
             pert = batch["pert_emb"].reshape(-1, self.cell_sentence_len, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(-1, self.cell_sentence_len, self.input_dim)
+            perturbation_ids = batch.get("perturbation_ids")
+            if perturbation_ids is not None:
+                perturbation_ids = perturbation_ids.reshape(-1, self.cell_sentence_len)
         else:
             # we are inferencing on a single batch, so accept variable length sentences
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
+            perturbation_ids = batch.get("perturbation_ids")
+            if perturbation_ids is not None:
+                perturbation_ids = perturbation_ids.reshape(1, -1)
 
         # Shape: [B, S, input_dim]
-        pert_embedding = self.encode_perturbation(pert)
+        pert_embedding = self.encode_perturbation(pert, perturbation_ids)
         control_cells = self.encode_basal_expression(basal)
 
         # Add encodings in input_dim space, then project to hidden_dim
@@ -499,7 +573,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self._token_features = res_pred
 
         # add to basal if predicting residual
-        if self.predict_residual and self.output_space == "all":
+        if (
+            self.predict_residual
+            and self.output_space == "all"
+            and not isinstance(self.gene_decoder, PanelFreeGeneDecoder)
+        ):
             # Project control_cells to hidden_dim space to match res_pred
             # control_cells_hidden = self.project_to_hidden(control_cells)
             # treat the actual prediction as a residual sum to basal
@@ -625,8 +703,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
             total_loss = total_loss + self.batch_token_weight * ce_loss
 
         # Auxiliary batch prediction loss (per token), if enabled
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
-            gene_targets = batch["pert_cell_counts"]
+        if isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "gene_targets" not in batch:
+            raise KeyError(
+                "PanelFreeGeneDecoder requires gene_targets/gene_embeddings. "
+                "Use PanelFreePerturbationDataModule or an equivalent collator."
+            )
+        has_panel_targets = isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "gene_targets" in batch
+        has_fixed_targets = not isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "pert_cell_counts" in batch
+        if self.gene_decoder is not None and (has_panel_targets or has_fixed_targets):
+            gene_targets = batch["gene_targets"] if has_panel_targets else batch["pert_cell_counts"]
             # Train decoder to map latent predictions to gene space
 
             if self.detach_decoder:
@@ -638,14 +723,29 @@ class StateTransitionPerturbationModel(PerturbationModel):
             else:
                 latent_preds = pred
 
-            pert_cell_counts_preds = self.gene_decoder(latent_preds)
-            if padded:
+            if isinstance(self.gene_decoder, PanelFreeGeneDecoder):
+                pert_cell_counts_preds = self.gene_decoder(
+                    latent_preds,
+                    batch["gene_embeddings"],
+                    fallback_ids=batch.get("gene_fallback_ids"),
+                    gene_baseline=batch.get("gene_baselines"),
+                    chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
+                )
+                gene_targets = gene_targets.reshape_as(pert_cell_counts_preds)
+            elif padded:
+                pert_cell_counts_preds = self.gene_decoder(latent_preds)
                 gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
             else:
+                pert_cell_counts_preds = self.gene_decoder(latent_preds)
                 gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
 
-            decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
-            decoder_loss = decoder_per_set.mean()
+            if has_panel_targets and "gene_mask" in batch:
+                mask = batch["gene_mask"].reshape_as(gene_targets).to(dtype=gene_targets.dtype)
+                squared_error = (pert_cell_counts_preds - gene_targets).square()
+                decoder_loss = (squared_error * mask).sum() / mask.sum().clamp_min(1)
+            else:
+                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+                decoder_loss = decoder_per_set.mean()
 
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
@@ -705,19 +805,42 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.log("val/sinkhorn_loss", sinkhorn_component)
             self.log("val/energy_loss", energy_component)
 
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
-            gene_targets = batch["pert_cell_counts"]
+        if isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "gene_targets" not in batch:
+            raise KeyError(
+                "PanelFreeGeneDecoder requires gene_targets/gene_embeddings. "
+                "Use PanelFreePerturbationDataModule or an equivalent collator."
+            )
+        has_panel_targets = isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "gene_targets" in batch
+        has_fixed_targets = not isinstance(self.gene_decoder, PanelFreeGeneDecoder) and "pert_cell_counts" in batch
+        if self.gene_decoder is not None and (has_panel_targets or has_fixed_targets):
+            gene_targets = batch["gene_targets"] if has_panel_targets else batch["pert_cell_counts"]
 
             # Get model predictions from validation step
             latent_preds = pred
 
             # Train decoder to map latent predictions to gene space
-            pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
-                -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
-            )
-            gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
-            decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
-            decoder_loss = decoder_per_set.mean()
+            if isinstance(self.gene_decoder, PanelFreeGeneDecoder):
+                pert_cell_counts_preds = self.gene_decoder(
+                    latent_preds,
+                    batch["gene_embeddings"],
+                    fallback_ids=batch.get("gene_fallback_ids"),
+                    gene_baseline=batch.get("gene_baselines"),
+                    chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
+                )
+                gene_targets = gene_targets.reshape_as(pert_cell_counts_preds)
+                if "gene_mask" in batch:
+                    mask = batch["gene_mask"].reshape_as(gene_targets).to(dtype=gene_targets.dtype)
+                    squared_error = (pert_cell_counts_preds - gene_targets).square()
+                    decoder_loss = (squared_error * mask).sum() / mask.sum().clamp_min(1)
+                else:
+                    decoder_loss = (pert_cell_counts_preds - gene_targets).square().mean()
+            else:
+                pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
+                    -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
+                )
+                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
+                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+                decoder_loss = decoder_per_set.mean()
 
             # Log the validation metric
             self.log("val/decoder_loss", decoder_loss)
@@ -792,9 +915,29 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if confidence_pred is not None:
             output_dict["confidence_pred"] = confidence_pred
 
-        if self.gene_decoder is not None:
+        if isinstance(self.gene_decoder, PanelFreeGeneDecoder):
+            if "gene_embeddings" not in batch:
+                raise KeyError(
+                    "PanelFreeGeneDecoder prediction requires gene_embeddings. "
+                    "Use PanelFreePerturbationDataModule or predict_vcc_counts."
+                )
+            if padded:
+                decoder_latent = latent_output.reshape(-1, self.cell_sentence_len, self.output_dim)
+            else:
+                decoder_latent = latent_output.reshape(1, -1, self.output_dim)
+            pert_cell_counts_preds = self.gene_decoder(
+                decoder_latent,
+                batch["gene_embeddings"],
+                fallback_ids=batch.get("gene_fallback_ids"),
+                gene_baseline=batch.get("gene_baselines"),
+                chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
+            )
+            output_dict["gene_names"] = batch.get("gene_names")
+            output_dict["gene_mask"] = batch.get("gene_mask")
+        elif self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
 
+        if self.gene_decoder is not None:
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict

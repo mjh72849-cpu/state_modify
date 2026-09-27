@@ -1,0 +1,78 @@
+name: state
+checkpoint: null
+device: cuda
+
+# ST-SE-Tahoe-compatible backbone with a panel-free genetic decoder.  Set
+# model.kwargs.init_from to the downloaded Tahoe checkpoint when launching a
+# real fine-tuning run.  The perturbation encoder is deliberately rebuilt when
+# its semantic gene-feature dimension differs from Tahoe's drug one-hot input.
+# Its protein-semantic output is augmented by a zero-initialized, independently
+# trainable residual row for every perturbation in the data registry.
+kwargs:
+  cell_set_len: 256
+  blur: 0.05
+  hidden_dim: 768
+  loss: energy
+  distributional_loss: energy
+  n_encoder_layers: 1
+  n_decoder_layers: 1
+  predict_residual: true
+  softplus: true
+  freeze_pert_backbone: false
+  # Stage A can override this to true. Stage B should set it back to false.
+  freeze_pretrained_backbone: false
+  finetune_vci_decoder: false
+  gene_decoder_bool: true
+  decoder_weight: 1.0
+  detach_decoder: false
+  gene_decoder_chunk_size: 512
+  optimizer_weight_decay: 0.0005
+  optimizer_group_lrs:
+    backbone: 5.0e-6
+    perturbation_encoder: 5.0e-5
+    decoder: 1.0e-4
+    fallback: 1.0e-4
+  batch_encoder: false
+  use_batch_token: false
+  mask_attn: false
+  embed_key: X_state
+  init_from: null
+
+  # No layer in this decoder depends on the number or order of genes.  Change
+  # gene_embedding_dim to match the chosen protein/gene embedding artifact.
+  panel_free_decoder_cfg:
+    # Local SE-600M protein_embeddings.pt vectors are 5,120-dimensional.
+    gene_embedding_dim: 5120
+    hidden_dim: 256
+    n_layers: 2
+    dropout: 0.1
+    fusion_mode: concat
+    use_gene_baseline: true
+    predict_residual: true
+    output_activation: identity
+    # Stable IDs are defined by assets/vcc_2026_se_fallback_genes.txt.
+    num_fallback_genes: 343
+
+  transformer_backbone_key: llama
+  transformer_backbone_kwargs:
+    bidirectional_attention: true
+    max_position_embeddings: ${model.kwargs.cell_set_len}
+    hidden_size: ${model.kwargs.hidden_dim}
+    intermediate_size: 3072
+    num_hidden_layers: 8
+    num_attention_heads: 12
+    num_key_value_heads: 12
+    head_dim: 64
+    use_cache: false
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    layer_norm_eps: 1e-6
+    pad_token_id: 0
+    bos_token_id: 1
+    eos_token_id: 2
+    tie_word_embeddings: false
+    rotary_dim: 0
+    use_rotary_embeddings: false
+
+  lora:
+    enable: false
