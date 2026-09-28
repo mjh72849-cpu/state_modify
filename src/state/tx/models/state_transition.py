@@ -156,8 +156,56 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
         self.cell_sentence_len = kwargs.get("cell_set_len", 256)
         self.decoder_loss_weight = kwargs.get("decoder_weight", 1.0)
+        # PDS-only mode is an explicit diagnostic/training ablation.  It
+        # optimizes the differentiable expression-space retrieval surrogate
+        # below and keeps the latent/decoder reconstruction losses as metrics
+        # only.  This is intentionally opt-in so the paper and VCC profiles
+        # retain their existing objectives.
+        self.pds_only = bool(kwargs.get("pds_only", False))
+        self.pds_loss_weight = float(kwargs.get("pds_loss_weight", 1.0))
+        self.pds_temperature = float(kwargs.get("pds_temperature", 0.1))
+        self.pds_effect_retrieval = bool(kwargs.get("pds_effect_retrieval", False))
+        self.pds_reconstruction_weight = float(kwargs.get("pds_reconstruction_weight", 0.0))
+        self.pds_memory_bank_size = int(kwargs.get("pds_memory_bank_size", 0))
+        self._pds_memory_bank: dict[str, dict[int, tuple[tuple[str, ...], torch.Tensor]]] = {}
+        if self.pds_loss_weight < 0:
+            raise ValueError("pds_loss_weight must be non-negative")
+        if self.pds_temperature <= 0:
+            raise ValueError("pds_temperature must be positive")
+        if self.pds_reconstruction_weight < 0:
+            raise ValueError("pds_reconstruction_weight must be non-negative")
+        if self.pds_memory_bank_size < 0:
+            raise ValueError("pds_memory_bank_size must be non-negative")
+        # These terms supervise the perturbation *effect*, not absolute cell
+        # state.  Absolute reconstruction alone has a strong control-copy
+        # shortcut and need not preserve perturbation identity.
+        self.latent_effect_cosine_weight = float(
+            kwargs.get("latent_effect_cosine_weight", 0.0)
+        )
+        self.latent_effect_magnitude_weight = float(
+            kwargs.get("latent_effect_magnitude_weight", 0.0)
+        )
+        self.latent_contrastive_weight = float(
+            kwargs.get("latent_contrastive_weight", 0.0)
+        )
+        self.latent_contrastive_temperature = float(
+            kwargs.get("latent_contrastive_temperature", 0.1)
+        )
+        self.decoder_effect_cosine_weight = float(
+            kwargs.get("decoder_effect_cosine_weight", 0.0)
+        )
+        self.control_calibrated_decoder = bool(
+            kwargs.get("control_calibrated_decoder", False)
+        )
         self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
+        self.perturbation_representation = str(
+            kwargs.get("perturbation_representation", "semantic_residual")
+        ).lower()
+        if self.perturbation_representation not in {"identity", "semantic_residual"}:
+            raise ValueError(
+                "perturbation_representation must be 'identity' or 'semantic_residual'"
+            )
 
         self.transformer_backbone_key = transformer_backbone_key
         self.transformer_backbone_kwargs = transformer_backbone_kwargs
@@ -189,9 +237,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
 
-        # Preserve the semantic protein prior while giving every observed
-        # genetic perturbation its own trainable identity. Zero initialization
-        # makes checkpoint transfer behavior identical before the first update.
+        # Build either the paper-like identity representation or the legacy
+        # semantic protein prior plus a zero-initialized identity residual.
         self.num_trainable_perturbations = int(num_trainable_perturbations)
         if self.num_trainable_perturbations < 0:
             raise ValueError("num_trainable_perturbations cannot be negative")
@@ -207,8 +254,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.trainable_perturbation_to_id = {
             name: index for index, name in enumerate(self.trainable_perturbation_names)
         }
+        self.perturbation_embedding = None
         self.perturbation_residual = None
-        if self.num_trainable_perturbations:
+        if self.perturbation_representation == "identity":
+            if not self.num_trainable_perturbations:
+                raise ValueError(
+                    "identity perturbations require num_trainable_perturbations > 0"
+                )
+            # Equivalent to one-hot(D) @ Linear(D, H), as used by STATE.  An
+            # Embedding avoids materializing the large one-hot tensor.
+            self.perturbation_embedding = nn.Embedding(
+                self.num_trainable_perturbations, self.hidden_dim
+            )
+            nn.init.kaiming_uniform_(
+                self.perturbation_embedding.weight.transpose(0, 1), a=math.sqrt(5)
+            )
+            # Protein vectors are still used by the gene-conditioned decoder,
+            # but not as the perturbation identity in this paper-like mode.
+            self.pert_encoder.requires_grad_(False)
+        elif self.num_trainable_perturbations:
             self.perturbation_residual = nn.Embedding(
                 self.num_trainable_perturbations, self.hidden_dim
             )
@@ -429,12 +493,31 @@ class StateTransitionPerturbationModel(PerturbationModel):
         pert: torch.Tensor,
         perturbation_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Combine the semantic encoding with an optional learned target residual.
+        """Encode a perturbation using identity-only or semantic-residual mode.
 
         ``-1`` is reserved for control and contributes exactly zero. Non-control
         IDs are stable rows in the registry emitted by the data preparation
         pipeline, so targets never collapse merely because names differ.
         """
+        representation = getattr(self, "perturbation_representation", "semantic_residual")
+        identity_table = getattr(self, "perturbation_embedding", None)
+        if representation == "identity":
+            if identity_table is None:
+                raise RuntimeError("identity perturbation table was not initialized")
+            if perturbation_ids is None:
+                raise KeyError("identity perturbations require batch['perturbation_ids']")
+            perturbation_ids = perturbation_ids.to(device=pert.device, dtype=torch.long)
+            if perturbation_ids.shape != pert.shape[:-1]:
+                raise ValueError(
+                    f"perturbation_ids shape {tuple(perturbation_ids.shape)} does not match "
+                    f"perturbation tokens {tuple(pert.shape[:-1])}"
+                )
+            active = perturbation_ids >= 0
+            if active.any() and perturbation_ids[active].max() >= identity_table.num_embeddings:
+                raise IndexError("perturbation ID is outside the trainable perturbation registry")
+            encoded = identity_table(perturbation_ids.clamp_min(0))
+            return encoded * active.unsqueeze(-1).to(encoded.dtype)
+
         encoded = self.pert_encoder(pert)
         residual_table = getattr(self, "perturbation_residual", None)
         if residual_table is None:
@@ -618,6 +701,313 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         return self.loss_fn(pred, target)
 
+    @staticmethod
+    def _set_effect_losses(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        basal: torch.Tensor,
+        perturbation_ids: torch.Tensor | None,
+        *,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return cosine, log-magnitude and retrieval losses for set effects."""
+        pred_delta = pred.mean(dim=1) - basal.mean(dim=1)
+        true_delta = target.mean(dim=1) - basal.mean(dim=1)
+        true_norm = true_delta.norm(dim=-1)
+        valid = true_norm > 1e-8
+        set_ids = None
+        if perturbation_ids is not None:
+            set_ids = perturbation_ids.reshape(pred.shape[0], -1)[:, 0]
+            valid = valid & (set_ids >= 0)
+        zero = pred.sum() * 0.0
+        if not valid.any():
+            return zero, zero, zero
+
+        pred_valid = pred_delta[valid]
+        true_valid = true_delta[valid]
+        pred_norm = pred_valid.norm(dim=-1)
+        true_norm_valid = true_valid.norm(dim=-1)
+        cosine_loss = (
+            1.0 - F.cosine_similarity(pred_valid, true_valid, dim=-1)
+        ).mean()
+        magnitude_loss = F.smooth_l1_loss(
+            torch.log(pred_norm + 1e-6),
+            torch.log(true_norm_valid + 1e-6),
+        )
+
+        # In-batch effect retrieval: the correct target effect should be more
+        # similar than other perturbations. Duplicate identities are removed so
+        # they are never treated as false negatives.
+        contrastive_loss = zero
+        if pred_valid.shape[0] > 1:
+            if set_ids is not None:
+                valid_ids = set_ids[valid]
+                keep = []
+                seen: set[int] = set()
+                for index, value in enumerate(valid_ids.detach().cpu().tolist()):
+                    if value not in seen:
+                        seen.add(value)
+                        keep.append(index)
+                keep_tensor = torch.tensor(keep, device=pred.device, dtype=torch.long)
+                pred_valid = pred_valid.index_select(0, keep_tensor)
+                true_valid = true_valid.index_select(0, keep_tensor)
+            if pred_valid.shape[0] > 1:
+                logits = F.normalize(pred_valid, dim=-1) @ F.normalize(
+                    true_valid, dim=-1
+                ).transpose(0, 1)
+                logits = logits / max(float(temperature), 1e-6)
+                labels = torch.arange(logits.shape[0], device=logits.device)
+                contrastive_loss = F.cross_entropy(logits, labels)
+        return cosine_loss, magnitude_loss, contrastive_loss
+
+    @staticmethod
+    def _panel_pds_retrieval_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        gene_mask: torch.Tensor | None,
+        gene_names,
+        perturbation_ids: torch.Tensor | None,
+        *,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Differentiable expression-space surrogate for the PDS ranking.
+
+        Cell-Eval computes PDS by asking whether a predicted profile is closer
+        to its own measured perturbation profile than to other perturbations.
+        This loss applies the same retrieval idea within a training batch:
+        rows are predicted Set profiles, columns are measured Set profiles,
+        and the diagonal is trained as the correct match.  Native panels may
+        differ between Sets, so each pair is compared on its shared gene names.
+        Controls (ID ``-1``) are excluded as they do not represent a scored
+        perturbation.
+        """
+        if prediction.dim() != 3 or target.shape != prediction.shape:
+            raise ValueError("prediction and target must both have shape [B,S,G]")
+        batch_size, _seq_len, n_genes = prediction.shape
+        if gene_mask is None:
+            valid_masks = [torch.ones(n_genes, dtype=torch.bool, device=prediction.device)] * batch_size
+        else:
+            mask = gene_mask.reshape(batch_size, prediction.shape[1], n_genes)[:, 0]
+            valid_masks = [mask[index].bool() for index in range(batch_size)]
+
+        if perturbation_ids is None:
+            active = torch.ones(batch_size, dtype=torch.bool, device=prediction.device)
+        else:
+            ids = perturbation_ids.reshape(batch_size, -1)[:, 0]
+            active = ids >= 0
+        active_indices = [index for index in range(batch_size) if bool(active[index].item())]
+        if len(active_indices) < 2:
+            return prediction.sum() * 0.0
+
+        # ``gene_names`` is a Python-side list emitted by the native-panel
+        # collator. Fall back to column IDs only for synthetic/unit-test
+        # batches that do not carry names.
+        if gene_names is None:
+            names_by_set = [list(range(n_genes)) for _ in range(batch_size)]
+        else:
+            names_by_set = []
+            for index in range(batch_size):
+                row = list(gene_names[index])
+                names_by_set.append(row[:n_genes])
+
+        pred_profile = prediction.mean(dim=1)
+        target_profile = target.mean(dim=1)
+        similarity_rows = []
+        usable = []
+        for row_index, source_index in enumerate(active_indices):
+            source_lookup = {
+                name: column
+                for column, name in enumerate(names_by_set[source_index])
+                if valid_masks[source_index][column] and name is not None
+            }
+            row_scores = []
+            has_diagonal = False
+            for column_index, target_index in enumerate(active_indices):
+                target_lookup = {
+                    name: column
+                    for column, name in enumerate(names_by_set[target_index])
+                    if valid_masks[target_index][column] and name is not None
+                }
+                common = [name for name in source_lookup if name in target_lookup]
+                if len(common) < 2:
+                    # Keep the row differentiable but make an unavailable
+                    # comparison unattractive; it is filtered below if the
+                    # diagonal itself is unavailable.
+                    row_scores.append(pred_profile[source_index].sum() * 0.0 - 1.0e4)
+                    continue
+                source_columns = torch.tensor(
+                    [source_lookup[name] for name in common],
+                    device=prediction.device,
+                    dtype=torch.long,
+                )
+                target_columns = torch.tensor(
+                    [target_lookup[name] for name in common],
+                    device=prediction.device,
+                    dtype=torch.long,
+                )
+                score = F.cosine_similarity(
+                    pred_profile[source_index].index_select(0, source_columns).unsqueeze(0),
+                    target_profile[target_index].index_select(0, target_columns).unsqueeze(0),
+                    dim=-1,
+                ).squeeze(0)
+                row_scores.append(score)
+                if source_index == target_index:
+                    has_diagonal = True
+            if has_diagonal:
+                similarity_rows.append(torch.stack(row_scores))
+                usable.append(row_index)
+
+        if len(similarity_rows) < 2:
+            return prediction.sum() * 0.0
+        logits = torch.stack(similarity_rows, dim=0) / max(float(temperature), 1e-6)
+        labels = torch.as_tensor(usable, device=prediction.device, dtype=torch.long)
+        return F.cross_entropy(logits, labels)
+
+    @staticmethod
+    def _panel_pds_effect_retrieval_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        control: torch.Tensor,
+        gene_mask: torch.Tensor,
+        gene_names,
+        perturbation_ids: torch.Tensor,
+        dataset_names: list[str],
+        pert_library_sizes: torch.Tensor,
+        ctrl_library_sizes: torch.Tensor,
+        *,
+        temperature: float,
+        excluded_genes: set[str] | None = None,
+        memory_bank: dict[str, dict[int, tuple[tuple[str, ...], torch.Tensor]]] | None = None,
+        memory_bank_size: int = 0,
+    ) -> torch.Tensor:
+        """Rank matched perturbation effects on one feature axis per source.
+
+        Each Set is first converted from per-cell log(CP10K) to a library-size
+        weighted pseudobulk, then its matched control pseudobulk is subtracted.
+        Only distinct perturbations from the same dataset are negatives.  A
+        single common gene axis is used for the entire retrieval matrix.
+        """
+        if prediction.ndim != 3 or prediction.shape != target.shape or control.shape != target.shape:
+            raise ValueError("prediction, target, and control must have shape [B,S,G]")
+        batch_size, seq_len, n_genes = prediction.shape
+        if len(gene_names) != batch_size or len(dataset_names) != batch_size:
+            raise ValueError("gene_names and dataset_names must have one row per Set")
+        if gene_mask.shape != prediction.shape:
+            raise ValueError("gene_mask must match prediction")
+        ids = perturbation_ids.reshape(batch_size, seq_len)[:, 0].tolist()
+        excluded = excluded_genes or set()
+
+        def pseudobulk(values: torch.Tensor, library_sizes: torch.Tensor) -> torch.Tensor:
+            weights = library_sizes.reshape(batch_size, seq_len, 1).to(values)
+            abundance = torch.expm1(values.float().clamp(min=0, max=12))
+            weighted = (abundance * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+            return torch.log1p(weighted)
+
+        pred_effect = pseudobulk(prediction, pert_library_sizes) - pseudobulk(control, ctrl_library_sizes)
+        real_effect = pseudobulk(target, pert_library_sizes) - pseudobulk(control, ctrl_library_sizes)
+        losses = []
+        for dataset_name in sorted(set(dataset_names)):
+            indices = []
+            seen_ids = set()
+            for index, (name, pert_id) in enumerate(zip(dataset_names, ids)):
+                if name == dataset_name and pert_id >= 0 and pert_id not in seen_ids:
+                    indices.append(index)
+                    seen_ids.add(pert_id)
+            if not indices:
+                continue
+            common = set(name for name in gene_names[indices[0]] if name is not None)
+            for index in indices[1:]:
+                common.intersection_update(name for name in gene_names[index] if name is not None)
+            common.difference_update(excluded)
+            lookups = []
+            for index in indices:
+                mask = gene_mask[index, 0].tolist()
+                lookups.append({name: column for column, name in enumerate(gene_names[index])
+                                if name is not None and mask[column]})
+                common.intersection_update(lookups[-1])
+            if len(common) < 2:
+                continue
+            genes = sorted(common)
+            pred_rows = torch.stack([
+                pred_effect[index, torch.tensor([lookup[gene] for gene in genes], device=prediction.device)]
+                for index, lookup in zip(indices, lookups)
+            ])
+            real_rows = torch.stack([
+                real_effect[index, torch.tensor([lookup[gene] for gene in genes], device=prediction.device)]
+                for index, lookup in zip(indices, lookups)
+            ])
+            bank = memory_bank.setdefault(dataset_name, {}) if memory_bank is not None else {}
+            candidates = [real_rows]
+            bank_rows = [
+                row.to(device=prediction.device, dtype=real_rows.dtype)
+                for pert_id, (saved_genes, row) in bank.items()
+                if pert_id not in seen_ids and saved_genes == tuple(genes)
+            ]
+            if bank_rows:
+                candidates.append(torch.stack(bank_rows))
+            all_real = torch.cat(candidates)
+            if all_real.shape[0] >= 2:
+                logits = F.normalize(pred_rows, dim=-1) @ F.normalize(all_real, dim=-1).T
+                labels = torch.arange(len(indices), device=prediction.device)
+                losses.append(F.cross_entropy(logits / temperature, labels))
+            if memory_bank is not None and memory_bank_size:
+                for index, row in zip(indices, real_rows.detach()):
+                    bank[ids[index]] = (tuple(genes), row.cpu())
+                    while len(bank) > memory_bank_size:
+                        bank.pop(next(iter(bank)))
+        return torch.stack(losses).mean() if losses else prediction.sum() * 0.0
+
+    def _decode_panel_free(
+        self,
+        latent: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        assert isinstance(self.gene_decoder, PanelFreeGeneDecoder)
+        decoder_kwargs = dict(
+            fallback_ids=batch.get("gene_fallback_ids"),
+            gene_baseline=batch.get("gene_baselines"),
+            read_depth=batch.get("decoder_read_depth"),
+            chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
+        )
+        if getattr(self, "control_calibrated_decoder", False):
+            control_latent = batch["ctrl_cell_emb"].reshape_as(latent)
+            return self.gene_decoder.forward_control_calibrated(
+                latent,
+                control_latent,
+                batch["gene_embeddings"],
+                **decoder_kwargs,
+            )
+        return self.gene_decoder(latent, batch["gene_embeddings"], **decoder_kwargs)
+
+    @staticmethod
+    def _masked_gene_effect_cosine_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        mask: torch.Tensor,
+        perturbation_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Cosine loss between predicted and true mean gene-expression deltas."""
+        expanded_baseline = PanelFreeGeneDecoder._expand_gene_baseline(
+            baseline.to(device=prediction.device, dtype=prediction.dtype),
+            prediction,
+            prediction.shape[-1],
+        )
+        pred_delta = (prediction - expanded_baseline).mean(dim=1)
+        true_delta = (target - expanded_baseline).mean(dim=1)
+        set_mask = mask[:, 0, :].to(prediction.dtype)
+        pred_delta = pred_delta * set_mask
+        true_delta = true_delta * set_mask
+        valid = true_delta.norm(dim=-1) > 1e-8
+        if perturbation_ids is not None:
+            set_ids = perturbation_ids.reshape(prediction.shape[0], -1)[:, 0]
+            valid = valid & (set_ids >= 0)
+        if not valid.any():
+            return prediction.sum() * 0.0
+        return (
+            1.0 - F.cosine_similarity(pred_delta[valid], true_delta[valid], dim=-1)
+        ).mean()
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
         batch = self._normalize_count_keys(batch)
@@ -637,9 +1027,24 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        # In PDS-only mode the latent loss remains a detached diagnostic; it
+        # must not contribute a gradient or retain its reconstruction graph.
+        loss_pred = pred.detach() if self.pds_only else pred
+        per_set_main_losses = self._compute_distribution_loss(loss_pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
+
+        basal = batch["ctrl_cell_emb"].reshape_as(target)
+        effect_cosine_loss, effect_magnitude_loss, contrastive_loss = self._set_effect_losses(
+            loss_pred,
+            target,
+            basal,
+            batch.get("perturbation_ids"),
+            temperature=self.latent_contrastive_temperature,
+        )
+        self.log("train/latent_effect_cosine_loss", effect_cosine_loss)
+        self.log("train/latent_effect_magnitude_loss", effect_magnitude_loss)
+        self.log("train/latent_contrastive_loss", contrastive_loss)
 
         # Log individual loss components if using combined loss
         if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
@@ -650,9 +1055,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Process decoder if available
         decoder_loss = None
-        total_loss = main_loss
+        if self.pds_only:
+            total_loss = pred.sum() * 0.0
+        else:
+            total_loss = (
+                main_loss
+                + self.latent_effect_cosine_weight * effect_cosine_loss
+                + self.latent_effect_magnitude_weight * effect_magnitude_loss
+                + self.latent_contrastive_weight * contrastive_loss
+            )
 
-        if self.use_batch_token and self.batch_classifier is not None and self._batch_token_cache is not None:
+        if (not self.pds_only) and self.use_batch_token and self.batch_classifier is not None and self._batch_token_cache is not None:
             logits = self.batch_classifier(self._batch_token_cache)  # [B, 1, C]
             batch_token_targets = batch["batch"]
 
@@ -724,13 +1137,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 latent_preds = pred
 
             if isinstance(self.gene_decoder, PanelFreeGeneDecoder):
-                pert_cell_counts_preds = self.gene_decoder(
-                    latent_preds,
-                    batch["gene_embeddings"],
-                    fallback_ids=batch.get("gene_fallback_ids"),
-                    gene_baseline=batch.get("gene_baselines"),
-                    chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
-                )
+                pert_cell_counts_preds = self._decode_panel_free(latent_preds, batch)
                 gene_targets = gene_targets.reshape_as(pert_cell_counts_preds)
             elif padded:
                 pert_cell_counts_preds = self.gene_decoder(latent_preds)
@@ -750,9 +1157,46 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
 
-            total_loss = total_loss + self.decoder_loss_weight * decoder_loss
+            if not self.pds_only:
+                total_loss = total_loss + self.decoder_loss_weight * decoder_loss
+            elif self.pds_reconstruction_weight:
+                total_loss = total_loss + self.pds_reconstruction_weight * decoder_loss
+            if self.pds_only and not has_panel_targets:
+                raise RuntimeError("pds_only=True requires panel-free gene targets")
+            if self.pds_only and has_panel_targets:
+                if self.pds_effect_retrieval:
+                    pds_surrogate_loss = self._panel_pds_effect_retrieval_loss(
+                        pert_cell_counts_preds, gene_targets, batch["gene_baselines"],
+                        batch["gene_mask"], batch["gene_names"], batch["perturbation_ids"],
+                        batch["set_dataset_names"], batch["decoder_pert_library_sizes"],
+                        batch["decoder_ctrl_library_sizes"], temperature=self.pds_temperature,
+                        memory_bank=self._pds_memory_bank if self.pds_memory_bank_size else None,
+                        memory_bank_size=self.pds_memory_bank_size,
+                    )
+                else:
+                    pds_surrogate_loss = self._panel_pds_retrieval_loss(
+                        pert_cell_counts_preds, gene_targets, batch.get("gene_mask"),
+                        batch.get("gene_names"), batch.get("perturbation_ids"),
+                        temperature=self.pds_temperature,
+                    )
+                self.log("train/pds_surrogate_loss", pds_surrogate_loss)
+                total_loss = total_loss + self.pds_loss_weight * pds_surrogate_loss
+            if (not self.pds_only) and has_panel_targets and self.decoder_effect_cosine_weight > 0:
+                if "gene_baselines" not in batch or "gene_mask" not in batch:
+                    raise KeyError(
+                        "decoder effect cosine loss requires gene_baselines and gene_mask"
+                    )
+                decoder_effect_loss = self._masked_gene_effect_cosine_loss(
+                    pert_cell_counts_preds,
+                    gene_targets,
+                    batch["gene_baselines"],
+                    batch["gene_mask"].reshape_as(gene_targets),
+                    batch.get("perturbation_ids"),
+                )
+                self.log("train/decoder_effect_cosine_loss", decoder_effect_loss)
+                total_loss = total_loss + self.decoder_effect_cosine_weight * decoder_effect_loss
 
-        if confidence_pred is not None:
+        if (not self.pds_only) and confidence_pred is not None:
             confidence_pred_vals = confidence_pred
             if confidence_pred_vals.dim() > 1:
                 confidence_pred_vals = confidence_pred_vals.squeeze(-1)
@@ -767,7 +1211,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             total_loss = total_loss + confidence_loss
 
-        if self.regularization > 0.0:
+        if (not self.pds_only) and self.regularization > 0.0:
             ctrl_cell_emb = batch["ctrl_cell_emb"].reshape_as(pred)
             delta = pred - ctrl_cell_emb
 
@@ -780,6 +1224,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Add regularization to total loss
             total_loss = total_loss + self.regularization * l1_loss
 
+        self.log("train/total_loss", total_loss)
         return total_loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -794,9 +1239,42 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
-        loss = torch.nanmean(per_set_main_losses)
-        self.log("val_loss", loss)
+        loss_pred = pred.detach() if self.pds_only else pred
+        per_set_main_losses = self._compute_distribution_loss(loss_pred, target)
+        main_loss = torch.nanmean(per_set_main_losses)
+        self.log("val_loss", main_loss)
+        loss = pred.sum() * 0.0 if self.pds_only else main_loss
+
+        # A direct diagnostic for whether the model predicts the direction and
+        # magnitude of perturbation-induced movement away from control.
+        basal = batch["ctrl_cell_emb"].reshape_as(target)
+        effect_cosine_loss, effect_magnitude_loss, contrastive_loss = self._set_effect_losses(
+            loss_pred,
+            target,
+            basal,
+            batch.get("perturbation_ids"),
+            temperature=self.latent_contrastive_temperature,
+        )
+        self.log("val/latent_effect_cosine_loss", effect_cosine_loss, on_step=False, on_epoch=True)
+        self.log("val/latent_effect_magnitude_loss", effect_magnitude_loss, on_step=False, on_epoch=True)
+        self.log("val/latent_contrastive_loss", contrastive_loss, on_step=False, on_epoch=True)
+        if not self.pds_only:
+            loss = (
+                loss
+                + self.latent_effect_cosine_weight * effect_cosine_loss
+                + self.latent_effect_magnitude_weight * effect_magnitude_loss
+                + self.latent_contrastive_weight * contrastive_loss
+            )
+        pred_delta = loss_pred.mean(dim=1) - basal.mean(dim=1)
+        true_delta = target.mean(dim=1) - basal.mean(dim=1)
+        true_norm = true_delta.norm(dim=-1)
+        pred_norm = pred_delta.norm(dim=-1)
+        valid_effect = true_norm > 1e-8
+        if valid_effect.any():
+            effect_cosine = F.cosine_similarity(pred_delta, true_delta, dim=-1)[valid_effect].mean()
+            effect_ratio = (pred_norm[valid_effect] / true_norm[valid_effect]).mean()
+            self.log("val/effect_cosine", effect_cosine, on_step=False, on_epoch=True)
+            self.log("val/effect_magnitude_ratio", effect_ratio, on_step=False, on_epoch=True)
 
         # Log individual loss components if using combined loss
         if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
@@ -820,13 +1298,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # Train decoder to map latent predictions to gene space
             if isinstance(self.gene_decoder, PanelFreeGeneDecoder):
-                pert_cell_counts_preds = self.gene_decoder(
-                    latent_preds,
-                    batch["gene_embeddings"],
-                    fallback_ids=batch.get("gene_fallback_ids"),
-                    gene_baseline=batch.get("gene_baselines"),
-                    chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
-                )
+                pert_cell_counts_preds = self._decode_panel_free(latent_preds, batch)
                 gene_targets = gene_targets.reshape_as(pert_cell_counts_preds)
                 if "gene_mask" in batch:
                     mask = batch["gene_mask"].reshape_as(gene_targets).to(dtype=gene_targets.dtype)
@@ -844,9 +1316,49 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # Log the validation metric
             self.log("val/decoder_loss", decoder_loss)
-            loss = loss + self.decoder_loss_weight * decoder_loss
+            if not self.pds_only:
+                loss = loss + self.decoder_loss_weight * decoder_loss
+            elif self.pds_reconstruction_weight:
+                loss = loss + self.pds_reconstruction_weight * decoder_loss
+            if self.pds_only and not has_panel_targets:
+                raise RuntimeError("pds_only=True requires panel-free gene targets")
+            if self.pds_only and has_panel_targets:
+                if self.pds_effect_retrieval:
+                    pds_surrogate_loss = self._panel_pds_effect_retrieval_loss(
+                        pert_cell_counts_preds, gene_targets, batch["gene_baselines"],
+                        batch["gene_mask"], batch["gene_names"], batch["perturbation_ids"],
+                        batch["set_dataset_names"], batch["decoder_pert_library_sizes"],
+                        batch["decoder_ctrl_library_sizes"], temperature=self.pds_temperature,
+                    )
+                else:
+                    pds_surrogate_loss = self._panel_pds_retrieval_loss(
+                        pert_cell_counts_preds, gene_targets, batch.get("gene_mask"),
+                        batch.get("gene_names"), batch.get("perturbation_ids"),
+                        temperature=self.pds_temperature,
+                    )
+                self.log("val/pds_surrogate_loss", pds_surrogate_loss, on_step=False, on_epoch=True)
+                loss = loss + self.pds_loss_weight * pds_surrogate_loss
+            if (not self.pds_only) and has_panel_targets and self.decoder_effect_cosine_weight > 0:
+                if "gene_baselines" not in batch or "gene_mask" not in batch:
+                    raise KeyError(
+                        "decoder effect cosine loss requires gene_baselines and gene_mask"
+                    )
+                decoder_effect_loss = self._masked_gene_effect_cosine_loss(
+                    pert_cell_counts_preds,
+                    gene_targets,
+                    batch["gene_baselines"],
+                    batch["gene_mask"].reshape_as(gene_targets),
+                    batch.get("perturbation_ids"),
+                )
+                self.log(
+                    "val/decoder_effect_cosine_loss",
+                    decoder_effect_loss,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                loss = loss + self.decoder_effect_cosine_weight * decoder_effect_loss
 
-        if confidence_pred is not None:
+        if (not self.pds_only) and confidence_pred is not None:
             confidence_pred_vals = confidence_pred
             if confidence_pred_vals.dim() > 1:
                 confidence_pred_vals = confidence_pred_vals.squeeze(-1)
@@ -858,6 +1370,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("val/confidence_loss", confidence_loss)
             self.log("val/actual_loss", confidence_targets.mean())
+            loss = loss + confidence_loss
+
+        # Checkpoint on the objective that is actually optimized, including
+        # gene supervision, instead of selecting only on latent distribution loss.
+        self.log("val/total_loss", loss, on_step=False, on_epoch=True)
 
         return {"loss": loss, "predictions": pred}
 
@@ -925,13 +1442,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 decoder_latent = latent_output.reshape(-1, self.cell_sentence_len, self.output_dim)
             else:
                 decoder_latent = latent_output.reshape(1, -1, self.output_dim)
-            pert_cell_counts_preds = self.gene_decoder(
-                decoder_latent,
-                batch["gene_embeddings"],
-                fallback_ids=batch.get("gene_fallback_ids"),
-                gene_baseline=batch.get("gene_baselines"),
-                chunk_size=self.hparams.get("gene_decoder_chunk_size", None),
-            )
+            pert_cell_counts_preds = self._decode_panel_free(decoder_latent, batch)
             output_dict["gene_names"] = batch.get("gene_names")
             output_dict["gene_mask"] = batch.get("gene_mask")
         elif self.gene_decoder is not None:

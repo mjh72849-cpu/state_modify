@@ -1,0 +1,9 @@
+[datasets]
+h1_21_train = "/sde/vcc/vcc2026/state/data/prepared/h1_holdout_21/h1_21_train.xstate.h5ad"
+
+[training]
+h1_21_train = "train"
+
+[zeroshot]
+
+[fewshot]

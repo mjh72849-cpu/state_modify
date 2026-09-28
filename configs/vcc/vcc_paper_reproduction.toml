@@ -1,0 +1,35 @@
+[pipeline]
+gpu = "2"
+python = "external/state-env/bin/python"
+num_workers = 8
+batch_size = 4
+gradient_accumulation = 2
+data_config = "vcc_panel_free_paper"
+model_config = "state_vcc_paper"
+
+[training]
+# Direct paper-style decoder: f(z_pert, e_gene, r_depth).
+stages = ["h1-loco-joint"]
+
+[training.max_steps]
+h1-loco-joint = 8000
+
+[training.val_freq]
+h1-loco-joint = 1000
+
+[training.init_from]
+h1-loco-joint = "external/ST-SE-Tahoe/zeroshot/state_generalization_zeroshot_X_state/checkpoints/best.ckpt"
+
+[inference]
+enabled = false
+
+[evaluation]
+enabled = true
+source_stage = "h1-loco-joint"
+min_pds_cosine = 0.60
+
+[submission]
+model_name = "state-paper-direct-decoder"
+description = "Paper-style direct decoder with gene embedding and read-depth feature"
+wait = false
+poll_interval = 30.0

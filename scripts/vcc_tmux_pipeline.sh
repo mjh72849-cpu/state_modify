@@ -8,13 +8,13 @@ PIPELINE="$ROOT/scripts/vcc_pipeline.py"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/vcc_tmux_pipeline.sh start PIPELINE_ID --confirm-submit [options]
+  scripts/vcc_tmux_pipeline.sh start PIPELINE_ID [--confirm-submit] [options]
   scripts/vcc_tmux_pipeline.sh status PIPELINE_ID
   scripts/vcc_tmux_pipeline.sh attach PIPELINE_ID
   scripts/vcc_tmux_pipeline.sh tail PIPELINE_ID
 
 Start options:
-  --profile warmup|production   Workflow profile (default: warmup)
+  --profile stageb-pds|warmup|paper-like|production   Workflow profile (default: stageb-pds)
   --gpu INDEX                  CUDA device (default: 2)
   --model-name NAME            VCC leaderboard model name
   --resume                     Resume checkpoints and completed pipeline steps
@@ -53,7 +53,7 @@ case "$action" in
     ;;
   start)
     shift 2
-    profile="warmup"
+    profile="stageb-pds"
     gpu="2"
     model_name=""
     resume=false
@@ -87,15 +87,15 @@ case "$action" in
           ;;
       esac
     done
-    if [[ "$profile" != "warmup" && "$profile" != "production" ]]; then
-      echo "--profile must be warmup or production" >&2
+    if [[ "$profile" != "stageb-pds" && "$profile" != "warmup" && "$profile" != "paper-like" && "$profile" != "production" ]]; then
+      echo "--profile must be stageb-pds, warmup, paper-like, or production" >&2
       exit 2
     fi
     if [[ ! "$gpu" =~ ^[0-9]+$ ]]; then
       echo "--gpu must be one CUDA device index" >&2
       exit 2
     fi
-    if [[ "$confirmed" != true ]]; then
+    if [[ "$profile" != "stageb-pds" && "$confirmed" != true ]]; then
       echo "Refusing to schedule a network submission without --confirm-submit" >&2
       exit 2
     fi
@@ -103,9 +103,15 @@ case "$action" in
       echo "tmux session already exists: $session" >&2
       exit 1
     fi
-    if [[ "$profile" == "warmup" ]]; then
+    if [[ "$profile" == "stageb-pds" ]]; then
+      config="$ROOT/configs/vcc/vcc_stageb_pds.toml"
+      default_model_name="state-stageb-pds-${pipeline_id}"
+    elif [[ "$profile" == "warmup" ]]; then
       config="$ROOT/configs/vcc/vcc_warmup_submit.toml"
       default_model_name="state-warmup-probe-${pipeline_id}"
+    elif [[ "$profile" == "paper-like" ]]; then
+      config="$ROOT/configs/vcc/vcc_paper_like_submit.toml"
+      default_model_name="state-paper-like-${pipeline_id}"
     else
       config="$ROOT/configs/vcc/vcc_pipeline.toml"
       default_model_name="state-production-${pipeline_id}"
@@ -113,18 +119,20 @@ case "$action" in
     model_name="${model_name:-$default_model_name}"
     run_suffix="_${pipeline_id}"
 
-    # Fail before creating the tmux session if credentials cannot submit.
-    "$PYTHON" - "$gpu" <<'PY'
+    # Check the device before detaching. Submission profiles additionally check
+    # credentials; stageb-pds intentionally stops after local .vcc packaging.
+    "$PYTHON" - "$gpu" "$confirmed" <<'PY'
 import json
 import subprocess
 import sys
 
 gpu = int(sys.argv[1])
-payload = json.loads(subprocess.run(
-    ["vcc", "whoami", "--json"], text=True, capture_output=True, check=True
-).stdout)
-if not payload.get("identity", {}).get("can_submit", False):
-    raise SystemExit("Current VCC profile is not allowed to submit")
+if sys.argv[2] == "true":
+    payload = json.loads(subprocess.run(
+        ["vcc", "whoami", "--json"], text=True, capture_output=True, check=True
+    ).stdout)
+    if not payload.get("identity", {}).get("can_submit", False):
+        raise SystemExit("Current VCC profile is not allowed to submit")
 try:
     import torch
     if gpu >= torch.cuda.device_count():
@@ -139,11 +147,11 @@ PY
       --config "$config"
       --gpu "$gpu"
       --run-suffix "$run_suffix"
-      --submit
-      --confirm-submit
-      --wait-submission
       --model-name "$model_name"
     )
+    if [[ "$confirmed" == true ]]; then
+      command+=(--submit --confirm-submit --wait-submission)
+    fi
     if [[ "$resume" == true ]]; then
       command+=(--resume)
     elif [[ -e "$ROOT/runs/pipelines/$pipeline_id/state.json" ]]; then

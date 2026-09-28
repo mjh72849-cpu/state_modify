@@ -27,6 +27,8 @@ class BalancedPerturbationBatchSampler(PerturbationBatchSampler):
         sets_per_dataset_per_epoch: int | None = 2048,
         control_perturbation: str | None = None,
         control_only_sets_per_epoch: int | None = 64,
+        group_batches_by_dataset: bool = False,
+        focus_perturbations: list[str] | None = None,
         **kwargs,
     ):
         self.balance_datasets = bool(balance_datasets)
@@ -36,12 +38,35 @@ class BalancedPerturbationBatchSampler(PerturbationBatchSampler):
         self.sets_per_dataset_per_epoch = sets_per_dataset_per_epoch
         self.control_perturbation = None if control_perturbation is None else str(control_perturbation).casefold()
         self.control_only_sets_per_epoch = control_only_sets_per_epoch
+        self.group_batches_by_dataset = bool(group_batches_by_dataset)
+        self.focus_perturbations = (
+            {str(name).upper() for name in focus_perturbations}
+            if focus_perturbations else None
+        )
         if control_only_sets_per_epoch is not None and control_only_sets_per_epoch <= 0:
             raise ValueError("control_only_sets_per_epoch must be positive or None")
         super().__init__(*args, **kwargs)
         self._natural_sentences = list(self.sentences)
         self.sentences = self._balanced_sentences(self.seed + self.epoch)
         self.batches = self._create_batches()
+
+    def _create_batches(self) -> list[list[int]]:
+        if not self.group_batches_by_dataset or self.test:
+            return super()._create_batches()
+        original = self.sentences
+        groups: dict[str, list[list[int]]] = defaultdict(list)
+        for sentence in original:
+            dataset_name, _ = self._sentence_identity(sentence)
+            groups[dataset_name].append(sentence)
+        batches: list[list[int]] = []
+        try:
+            for dataset_name in sorted(groups):
+                self.sentences = groups[dataset_name]
+                batches.extend(super()._create_batches())
+        finally:
+            self.sentences = original
+        np.random.default_rng(self.seed + self.epoch + 31).shuffle(batches)
+        return batches
 
     def _sentence_identity(self, sentence: list[int]) -> tuple[str, str]:
         if not sentence:
@@ -65,6 +90,12 @@ class BalancedPerturbationBatchSampler(PerturbationBatchSampler):
         pools: dict[str, dict[str, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
         for sentence in self._natural_sentences:
             dataset_name, perturbation = self._sentence_identity(sentence)
+            if (
+                getattr(self, "focus_perturbations", None) is not None
+                and perturbation.upper() not in self.focus_perturbations
+                and perturbation.casefold() != self.control_perturbation
+            ):
+                continue
             pools[dataset_name][perturbation].append(sentence)
         if not pools:
             return []

@@ -24,6 +24,7 @@ def test_concise_progress_uses_optimizer_steps(monkeypatch):
                 "train_loss": torch.tensor(0.75),
                 "decoder_loss": torch.tensor(0.05),
                 "train/gradient_norm": torch.tensor(1.25),
+                "train/gradient_norm_perturbation_encoder": torch.tensor(0.75),
             },
         },
     )()
@@ -43,6 +44,34 @@ def test_concise_progress_uses_optimizer_steps(monkeypatch):
     assert "decoder_loss=0.050000" in messages[0]
     assert "total_loss=0.850000" in messages[0]
     assert "gradient_norm=1.2500" in messages[0]
+    assert "pert_grad=0.7500" in messages[0]
+
+
+def test_concise_progress_reports_optimized_pds_loss(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "state.tx.callbacks.concise_progress.rank_zero_info",
+        lambda message, *args: messages.append(message % args),
+    )
+    trainer = type(
+        "Trainer", (),
+        {
+            "global_step": 50,
+            "max_steps": 100,
+            "callback_metrics": {
+                "train_loss": torch.tensor(1.3),
+                "decoder_loss": torch.tensor(0.1),
+                "train/pds_surrogate_loss": torch.tensor(0.7),
+                "train/total_loss": torch.tensor(0.71),
+            },
+        },
+    )()
+    model = type("Model", (), {"pds_only": True, "decoder_loss_weight": 0.0})()
+    callback = ConciseProgressCallback(logging_interval=50)
+    callback.on_train_start(trainer, model)
+    callback.on_train_batch_end(trainer, model, None, None, 0)
+    assert "pds_surrogate=0.700000" in messages[0]
+    assert "total_loss=0.710000" in messages[0]
 
 
 class FakeTrainer:

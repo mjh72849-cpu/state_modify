@@ -56,11 +56,23 @@ def main() -> None:
     parser.add_argument("mode", choices=tuple(DEFAULTS))
     parser.add_argument("--gpu", default="0", help="One CUDA device index, e.g. 0")
     parser.add_argument("--name")
+    parser.add_argument("--toml", type=Path, help="Override the data-split manifest for this run")
     parser.add_argument("--init-from", type=Path)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--val-freq", type=int)
     parser.add_argument("--batch-size", type=int, default=1, help="Number of cell Sets per optimizer microbatch")
     parser.add_argument("--gradient-accumulation", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--data-config",
+        default="vcc_panel_free",
+        help="Hydra data config group (default: vcc_panel_free)",
+    )
+    parser.add_argument(
+        "--model-config",
+        default="state_vcc",
+        help="Hydra model config group (default: state_vcc)",
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Resume an existing run from checkpoints/last.ckpt")
     parser.add_argument("--overwrite", action="store_true")
@@ -74,7 +86,7 @@ def main() -> None:
 
     profile = DEFAULTS[args.mode]
     init_from = (args.init_from or profile["init"]).resolve()
-    toml = profile["toml"].resolve()
+    toml = (args.toml or profile["toml"]).resolve()
     if not STATE.is_file():
         raise FileNotFoundError(STATE)
     if not toml.is_file():
@@ -91,6 +103,9 @@ def main() -> None:
 
     name = args.name or profile["name"]
     max_steps = args.max_steps or profile["steps"]
+    val_freq = args.val_freq or profile["val_freq"]
+    if max_steps <= 0 or val_freq <= 0:
+        raise ValueError("max steps and validation frequency must be positive")
     run_dir = ROOT / "runs" / name
     if run_dir.exists() and not (args.overwrite or args.resume):
         raise FileExistsError(
@@ -100,8 +115,8 @@ def main() -> None:
         raise FileNotFoundError(f"Cannot resume without {run_dir / 'checkpoints/last.ckpt'}")
     command = [
         str(STATE), "tx", "train",
-        "data=vcc_panel_free",
-        "model=state_vcc",
+        f"data={args.data_config}",
+        f"model={args.model_config}",
         f"data.kwargs.toml_config_path={toml}",
         f"data.kwargs.num_workers={args.num_workers}",
         f"model.kwargs.init_from={init_from}",
@@ -111,8 +126,9 @@ def main() -> None:
         "training.log_every_n_steps=50",
         "training.enable_progress_bar=false",
         "training.console_log_every_n_steps=50",
+        "training.checkpoint_monitor=val/total_loss",
         f"training.max_steps={max_steps}",
-        f"training.val_freq={profile['val_freq']}",
+        f"training.val_freq={val_freq}",
         f"output_dir={ROOT / 'runs'}",
         f"name={name}",
         f"use_wandb={str(args.wandb).lower()}",

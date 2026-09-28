@@ -21,6 +21,8 @@ from state.tx.vcc import (
     log_cp10k_to_counts,
     build_vcc_control_pool,
     control_log_cp10k_baseline,
+    control_log_cp10k_rows,
+    control_log_cp10k_read_depth,
     predict_vcc_counts,
     predict_vcc_pooled_counts,
     VCCPredictionWriter,
@@ -87,6 +89,41 @@ def test_panel_free_decoder_accepts_arbitrary_panels_and_chunks():
     full.sum().backward()
     assert latent.grad is not None
     assert all(size != 13 for parameter in decoder.parameters() for size in parameter.shape)
+
+
+def test_paper_decoder_requires_and_uses_scalar_read_depth():
+    torch.manual_seed(2)
+    decoder = PanelFreeGeneDecoder(
+        latent_dim=5,
+        gene_embedding_dim=7,
+        hidden_dim=11,
+        n_layers=2,
+        dropout=0.0,
+        fusion_mode="concat",
+        use_read_depth=True,
+        output_activation="identity",
+    )
+    latent = torch.randn(2, 3, 5)
+    genes = torch.randn(4, 7)
+    depth = torch.tensor([1.0, 2.0])
+    output = decoder(latent, genes, read_depth=depth)
+    assert output.shape == (2, 3, 4)
+    with pytest.raises(ValueError, match="read_depth is required"):
+        decoder(latent, genes)
+    shifted = decoder(latent, genes, read_depth=depth + 1.0)
+    assert not torch.allclose(output, shifted)
+
+
+def test_control_read_depth_is_mean_log_cp10k_over_expressed_genes():
+    raw = sparse.csr_matrix([[1, 3, 0], [0, 2, 2]], dtype=np.float32)
+    expected = np.array(
+        [
+            (np.log1p(2500.0) + np.log1p(7500.0)) / 2,
+            np.log1p(5000.0),
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(control_log_cp10k_read_depth(raw), expected, rtol=1e-6)
 
 
 def test_panel_free_decoder_uses_stable_trainable_fallback_ids():
@@ -253,6 +290,13 @@ def test_control_baseline_is_mean_per_cell_log_cp10k():
     raw = sparse.csr_matrix([[1, 3], [3, 1]], dtype=np.float32)
     actual = control_log_cp10k_baseline(raw)
     expected = np.log1p(np.asarray([[2500, 7500], [7500, 2500]], dtype=np.float32)).mean(0)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+
+def test_control_baseline_rows_preserve_donor_heterogeneity():
+    raw = sparse.csr_matrix([[1, 3], [3, 1]], dtype=np.float32)
+    actual = control_log_cp10k_rows(raw)
+    expected = np.log1p(np.asarray([[2500, 7500], [7500, 2500]], dtype=np.float32))
     np.testing.assert_allclose(actual, expected, rtol=1e-6)
 
 
@@ -440,6 +484,7 @@ def test_panel_free_collate_builds_matched_control_cp10k_baseline():
     module.decoder_always_include = set()
     module.decoder_fallback_gene_to_id = {}
     module.decoder_control_residual = True
+    module.decoder_read_depth = True
     module.is_log1p = False
     module.cell_sentence_len = 2
     module._panel_names = {"k562": ["A", "B"]}
@@ -461,8 +506,15 @@ def test_panel_free_collate_builds_matched_control_cp10k_baseline():
     expected = torch.stack([
         torch.log1p(torch.tensor([2000.0, 8000.0])),
         torch.log1p(torch.tensor([4000.0, 6000.0])),
-    ]).mean(0)
+    ])
     torch.testing.assert_close(batch["gene_baselines"][0], expected)
+    expected_depth = torch.tensor(
+        [
+            (torch.log1p(torch.tensor(2000.0)) + torch.log1p(torch.tensor(8000.0))) / 2,
+            (torch.log1p(torch.tensor(4000.0)) + torch.log1p(torch.tensor(6000.0))) / 2,
+        ]
+    )
+    torch.testing.assert_close(batch["decoder_read_depth"][0, :, 0], expected_depth)
 
 
 def test_panel_free_data_module_collates_mixed_dataset_sets():
@@ -616,6 +668,24 @@ def test_transfer_optimizer_uses_separate_learning_rate_groups():
     assert sum(parameter.numel() for parameter in groups["perturbation_encoder"]["params"]) == 27
 
 
+def test_identity_embedding_is_grouped_with_perturbation_encoder():
+    model = nn.Module()
+    model.backbone = nn.Linear(2, 2)
+    model.perturbation_embedding = nn.Embedding(5, 3)
+    model.optimizer_group_lrs = {
+        "backbone": 1e-6,
+        "perturbation_encoder": 2e-5,
+        "decoder": 3e-4,
+        "fallback": 4e-4,
+    }
+    model.optimizer_weight_decay = 0.0
+    model.lr = 1e-4
+
+    optimizer = PerturbationModel.configure_optimizers(model)
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    assert sum(p.numel() for p in groups["perturbation_encoder"]["params"]) == 15
+
+
 def test_trainable_perturbation_residual_is_target_specific_and_control_is_zero():
     model = StateTransitionPerturbationModel.__new__(StateTransitionPerturbationModel)
     nn.Module.__init__(model)
@@ -636,6 +706,186 @@ def test_trainable_perturbation_residual_is_target_specific_and_control_is_zero(
     assert gradient[0].abs().sum() == 0
     assert gradient[1].abs().sum() > 0
     assert gradient[2].abs().sum() > 0
+
+
+def test_paper_identity_embedding_is_target_specific_and_ignores_semantic_input():
+    model = StateTransitionPerturbationModel.__new__(StateTransitionPerturbationModel)
+    nn.Module.__init__(model)
+    model.perturbation_representation = "identity"
+    model.perturbation_embedding = nn.Embedding(3, 4)
+    with torch.no_grad():
+        model.perturbation_embedding.weight.copy_(torch.arange(12).reshape(3, 4))
+
+    ids = torch.tensor([[-1, 0, 1]])
+    first = model.encode_perturbation(torch.randn(1, 3, 9), ids)
+    second = model.encode_perturbation(torch.randn(1, 3, 9) * 100, ids)
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first[0, 0], torch.zeros(4))
+    assert not torch.equal(first[0, 1], first[0, 2])
+
+    first.sum().backward()
+    gradient = model.perturbation_embedding.weight.grad
+    assert gradient is not None
+    assert gradient[0].abs().sum() > 0
+    assert gradient[1].abs().sum() > 0
+    assert gradient[2].abs().sum() == 0
+
+
+def test_control_calibrated_decoder_is_exact_baseline_for_equal_states():
+    decoder = PanelFreeGeneDecoder(
+        latent_dim=4,
+        gene_embedding_dim=3,
+        hidden_dim=6,
+        dropout=0.0,
+        fusion_mode="concat",
+        use_gene_baseline=True,
+        predict_residual=True,
+        output_activation="identity",
+    )
+    latent = torch.randn(2, 3, 4)
+    genes = torch.randn(2, 5, 3)
+    baseline = torch.randn(2, 5)
+
+    output = decoder.forward_control_calibrated(
+        latent,
+        latent,
+        genes,
+        gene_baseline=baseline,
+        chunk_size=2,
+    )
+
+    torch.testing.assert_close(output, baseline[:, None, :].expand_as(output))
+
+
+def test_effect_losses_reward_correct_target_specific_directions():
+    basal = torch.zeros(3, 2, 3)
+    target = torch.tensor(
+        [
+            [[1.0, 0.2, 0.0], [1.0, 0.2, 0.0]],
+            [[0.1, 1.0, 0.0], [0.1, 1.0, 0.0]],
+            [[0.0, 0.1, 1.0], [0.0, 0.1, 1.0]],
+        ]
+    )
+    ids = torch.tensor([0, 0, 1, 1, 2, 2])
+
+    cosine, magnitude, contrastive = StateTransitionPerturbationModel._set_effect_losses(
+        target,
+        target,
+        basal,
+        ids,
+        temperature=0.1,
+    )
+
+    assert cosine < 1e-6
+    assert magnitude < 1e-6
+    assert contrastive < 1e-3
+
+
+def test_panel_pds_retrieval_loss_is_differentiable_and_excludes_controls():
+    prediction = torch.tensor(
+        [
+            [[1.0, 0.2, 0.0], [1.0, 0.2, 0.0]],
+            [[0.1, 1.0, 0.0], [0.1, 1.0, 0.0]],
+            [[0.0, 0.1, 1.0], [0.0, 0.1, 1.0]],
+        ],
+        requires_grad=True,
+    )
+    target = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+        ]
+    )
+    ids = torch.tensor([0, 0, 1, 1, -1, -1])
+    mask = torch.ones(3, 2, 3, dtype=torch.bool)
+    names = [["A", "B", "C"]] * 3
+
+    loss = StateTransitionPerturbationModel._panel_pds_retrieval_loss(
+        prediction,
+        target,
+        mask,
+        names,
+        ids,
+        temperature=0.1,
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert prediction.grad is not None
+    assert prediction.grad.abs().sum() > 0
+
+
+def test_effect_pds_retrieval_uses_control_delta_and_ignores_duplicate_targets():
+    baseline = torch.ones(3, 2, 4)
+    target = baseline.clone()
+    target[0, :, 1] = 4.0
+    target[1, :, 1] = 4.0  # duplicate perturbation, not a negative
+    target[2, :, 2] = 4.0
+    prediction = target.clone().requires_grad_()
+    ids = torch.tensor([0, 0, 0, 0, 1, 1])
+    names = [["TARGET_A", "B", "C", "D"]] * 3
+    kwargs = dict(
+        control=baseline,
+        gene_mask=torch.ones_like(target, dtype=torch.bool),
+        gene_names=names,
+        perturbation_ids=ids,
+        dataset_names=["K562"] * 3,
+        pert_library_sizes=torch.full((3, 2), 1000.0),
+        ctrl_library_sizes=torch.full((3, 2), 1000.0),
+        temperature=0.1,
+        excluded_genes={"TARGET_A"},
+    )
+    good = StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+        prediction, target, **kwargs
+    )
+    bad = StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+        prediction[[2, 1, 0]], target, **kwargs
+    )
+    assert torch.isfinite(good) and good < bad
+    good.backward()
+    assert prediction.grad is not None and prediction.grad.abs().sum() > 0
+
+
+def test_effect_pds_memory_bank_supplies_negatives_for_one_target_batches():
+    baseline = torch.ones(2, 2, 4)
+    target = baseline.clone()
+    target[0, :, 1] = 4.0
+    target[1, :, 2] = 4.0
+    names = [["A", "B", "C", "D"]] * 2
+    bank = {}
+    common = dict(
+        control=baseline,
+        gene_mask=torch.ones_like(target, dtype=torch.bool),
+        gene_names=names,
+        perturbation_ids=torch.tensor([0, 0, 1, 1]),
+        dataset_names=["H1", "H1"],
+        pert_library_sizes=torch.full((2, 2), 1000.0),
+        ctrl_library_sizes=torch.full((2, 2), 1000.0),
+        temperature=0.1,
+        memory_bank=bank,
+        memory_bank_size=8,
+    )
+    StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+        target, target, **common
+    )
+    assert set(bank["H1"]) == {0, 1}
+    prediction = target[:1].clone().requires_grad_()
+    single = dict(common)
+    single.update(
+        control=baseline[:1],
+        gene_mask=common["gene_mask"][:1],
+        gene_names=names[:1],
+        perturbation_ids=common["perturbation_ids"][:2],
+        dataset_names=["H1"],
+        pert_library_sizes=common["pert_library_sizes"][:1],
+        ctrl_library_sizes=common["ctrl_library_sizes"][:1],
+    )
+    loss = StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+        prediction, target[:1], **single
+    )
+    assert torch.isfinite(loss) and loss > 0
+    loss.backward()
+    assert prediction.grad is not None and prediction.grad.abs().sum() > 0
 
 
 def test_state_panel_free_all_space_keeps_latent_residual_path():

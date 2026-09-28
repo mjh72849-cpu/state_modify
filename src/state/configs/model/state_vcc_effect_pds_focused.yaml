@@ -1,0 +1,6 @@
+defaults:
+  - state_vcc_effect_pds
+  - _self_
+
+kwargs:
+  pds_memory_bank_size: 64

@@ -1,0 +1,6 @@
+defaults:
+  - vcc_panel_free_effect_pds
+  - _self_
+
+kwargs:
+  focus_perturbations_file: assets/vcc_h1_shared_21.txt

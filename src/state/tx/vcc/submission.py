@@ -82,6 +82,49 @@ def control_log_cp10k_baseline(raw_counts, *, target_sum: float = 10_000.0, bloc
     return (total / raw.shape[0]).astype(np.float32)
 
 
+def control_log_cp10k_rows(
+    raw_counts,
+    *,
+    target_sum: float = 10_000.0,
+    gene_indices: np.ndarray | list[int] | None = None,
+) -> np.ndarray:
+    """Per-cell log1p(CP10K) baselines, optionally restricted to genes."""
+    if target_sum <= 0:
+        raise ValueError("target_sum must be positive")
+    raw = _validated_raw_csr(raw_counts)
+    depths = np.asarray(raw.sum(axis=1)).ravel()
+    if (depths <= 0).any():
+        raise ValueError("Control cells must have positive library sizes")
+    normalized = raw.multiply((target_sum / depths)[:, None]).tocsr()
+    normalized.data = np.log1p(normalized.data)
+    if gene_indices is not None:
+        normalized = normalized[:, np.asarray(gene_indices, dtype=np.int64)]
+    return normalized.toarray().astype(np.float32, copy=False)
+
+
+def control_log_cp10k_read_depth(
+    raw_counts,
+    *,
+    target_sum: float = 10_000.0,
+) -> np.ndarray:
+    """Return the paper-style mean log1p(CP10K) depth for each control cell.
+
+    The mean is taken over genes with positive raw counts, matching the scalar
+    read-depth feature used by the paper's gene-expression decoder.
+    """
+    if target_sum <= 0:
+        raise ValueError("target_sum must be positive")
+    raw = _validated_raw_csr(raw_counts)
+    depths = np.asarray(raw.sum(axis=1)).ravel()
+    if (depths <= 0).any():
+        raise ValueError("Control cells must have positive library sizes")
+    normalized = raw.multiply((target_sum / depths)[:, None]).tocsr()
+    normalized.data = np.log1p(normalized.data)
+    totals = np.asarray(normalized.sum(axis=1)).ravel()
+    expressed = np.diff(normalized.indptr).astype(np.float32)
+    return (totals / np.maximum(expressed, 1.0)).astype(np.float32)
+
+
 class VCCPredictionWriter:
     """Append target-sized count blocks to an official-order sparse H5AD."""
 

@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,7 +76,48 @@ def test_submission_id_parser_accepts_current_cli_shapes():
     assert pipeline.extract_submission_id('{"entry_id":"abc"}') == "abc"
     assert pipeline.extract_submission_id('{"submission":{"id":123}}') == "123"
     assert pipeline.extract_submission_id('{"status":"uploading"}\n{"entry_id":"xyz"}') == "xyz"
+    assert pipeline.extract_submission_id("  entry: xWULcIFxQmyyqdRxv61I") == "xWULcIFxQmyyqdRxv61I"
+    assert (
+        pipeline.extract_submission_id("✓ submitted — entry ezCECDQmboLVkaUrMUgM")
+        == "ezCECDQmboLVkaUrMUgM"
+    )
     assert pipeline.extract_submission_id("not json") is None
+
+
+def test_read_aggregate_metric_reads_mean_row(tmp_path):
+    metrics = tmp_path / "agg_results.csv"
+    metrics.write_text(
+        "statistic,pds_cosine,pds_l1\n"
+        "count,144,144\n"
+        "mean,0.5029,0.5009\n"
+    )
+
+    assert pipeline.read_aggregate_metric(metrics, "pds_cosine") == 0.5029
+
+
+def test_submission_style_log_preserves_cli_output_verbatim(tmp_path, monkeypatch):
+    python = sys.executable
+    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "PIPELINE_ROOT", tmp_path / "pipelines")
+    monkeypatch.setattr(pipeline, "LOG_ROOT", tmp_path / "logs")
+    tracker = object.__new__(pipeline.Tracker)
+    tracker.pipeline_id = "human-log"
+    tracker.directory = tmp_path / "pipelines/human-log"
+    tracker.state_path = tracker.directory / "state.json"
+    tracker.events_path = tracker.directory / "events.jsonl"
+    tracker.state = {"steps": {}}
+
+    output = tracker.run(
+        "submission",
+        [python, "-c", "print('→ uploading …')"],
+        "submission",
+        capture=True,
+        log_markers=False,
+    )
+
+    log = tmp_path / "logs/submission/human-log__submission.log"
+    assert output == "→ uploading …\n"
+    assert log.read_text() == output
 
 
 def test_warmup_submit_config_infers_from_warmup_best_checkpoint(tmp_path, monkeypatch):

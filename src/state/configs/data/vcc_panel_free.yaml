@@ -18,8 +18,9 @@ kwargs:
   control_pert: non-targeting
   map_controls: true
   perturbation_features_file: external/SE-600M/protein_embeddings.pt
-  # Stable IDs for a learned per-target residual. This registry is the sorted
-  # union of non-control targets in the focused H1/K562/HCT116/HEK293T data.
+  # Stable IDs for per-target residual rows. This is the sorted union of
+  # non-control targets in the four focused data and is shared by both decoder
+  # profiles.
   trainable_perturbation_names_file: assets/vcc_trainable_perturbations.txt
   # Only these VCC-required genes may bypass a missing SE protein embedding.
   # Other datasets' remaining out-of-vocabulary genes are still filtered.

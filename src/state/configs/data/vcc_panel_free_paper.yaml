@@ -1,0 +1,45 @@
+name: PanelFreePerturbationDataModule
+kwargs:
+  # Paper-compatible panel-free supervision.  The source data, set sampler,
+  # gene fallback registry, and native-panel handling match vcc_panel_free.
+  toml_config_path: null
+  embed_key: X_state
+  output_space: all
+  pert_rep: onehot
+  basal_rep: sample
+  num_workers: 12
+  pin_memory: true
+  n_basal_samples: 1
+  basal_mapping_strategy: batch
+  should_yield_control_cells: true
+  batch_col: batch
+  pert_col: target_gene
+  cell_type_key: cell_type
+  control_pert: non-targeting
+  map_controls: true
+  perturbation_features_file: external/SE-600M/protein_embeddings.pt
+  trainable_perturbation_names_file: assets/vcc_trainable_perturbations.txt
+  decoder_fallback_gene_names_file: assets/vcc_2026_se_fallback_genes.txt
+  store_raw_basal: true
+  is_log1p: false
+  barcode: true
+  use_consecutive_loading: false
+  drop_last: false
+  val_subsample_fraction: 1.0
+
+  max_decoder_genes: 1024
+  decoder_target_sum: 10000
+  decoder_seed: 42
+  decoder_always_include: []
+  decoder_deg_fraction: 0.6
+  decoder_deg_min_control_cpm: 5.0
+  # The paper decoder receives a scalar read-depth feature, not a per-gene
+  # measured control baseline.  Keep raw matched controls to compute it.
+  decoder_control_residual: false
+  decoder_read_depth: true
+
+  balance_datasets: true
+  balance_perturbations: true
+  sets_per_dataset_per_epoch: 2048
+  validation_sets_per_dataset: 256
+  control_only_sets_per_epoch: 64

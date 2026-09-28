@@ -1,0 +1,9 @@
+[datasets]
+arc_h1_train = "/sde/vcc/vcc2026/state/data/prepared/focused/arc_h1_train.focused.xstate.h5ad"
+
+[training]
+arc_h1_train = "train"
+
+[zeroshot]
+
+[fewshot]

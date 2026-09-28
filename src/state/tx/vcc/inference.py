@@ -18,6 +18,7 @@ def predict_vcc_log_expression(
     perturbation_ids: torch.Tensor | int | None = None,
     query_gene_fallback_ids: torch.Tensor | None = None,
     query_gene_baseline: torch.Tensor | None = None,
+    query_read_depth: torch.Tensor | None = None,
     cell_chunk_size: int = 256,
     gene_chunk_size: int = 512,
 ) -> torch.Tensor:
@@ -57,15 +58,27 @@ def predict_vcc_log_expression(
             latent = model(batch, padded=False)
             if isinstance(latent, tuple):
                 latent = latent[0]
-            decoded.append(
-                decoder(
+            control_latent = control_embeddings[start:stop].unsqueeze(0)
+            if decoder.use_gene_baseline and query_gene_baseline is not None:
+                values = decoder.forward_control_calibrated(
+                    latent,
+                    control_latent,
+                    query_gene_embeddings,
+                    fallback_ids=query_gene_fallback_ids,
+                    gene_baseline=query_gene_baseline,
+                    read_depth=query_read_depth[start:stop] if query_read_depth is not None else None,
+                    chunk_size=gene_chunk_size,
+                )
+            else:
+                values = decoder(
                     latent,
                     query_gene_embeddings,
                     fallback_ids=query_gene_fallback_ids,
                     gene_baseline=query_gene_baseline,
+                    read_depth=query_read_depth[start:stop] if query_read_depth is not None else None,
                     chunk_size=gene_chunk_size,
-                ).squeeze(0)
-            )
+                )
+            decoded.append(values.squeeze(0))
     finally:
         model.train(was_training)
     return torch.cat(decoded, dim=0)
@@ -82,6 +95,7 @@ def predict_vcc_counts(
     perturbation_ids: torch.Tensor | int | None = None,
     query_gene_fallback_ids: torch.Tensor | None = None,
     query_gene_baseline: torch.Tensor | None = None,
+    query_read_depth: torch.Tensor | None = None,
     cell_chunk_size: int = 256,
     gene_chunk_size: int = 512,
     concentration: float | None = None,
@@ -102,6 +116,7 @@ def predict_vcc_counts(
         perturbation_ids=perturbation_ids,
         query_gene_fallback_ids=query_gene_fallback_ids,
         query_gene_baseline=query_gene_baseline,
+        query_read_depth=query_read_depth,
         cell_chunk_size=cell_chunk_size,
         gene_chunk_size=gene_chunk_size,
     )
@@ -125,6 +140,7 @@ def predict_vcc_pooled_counts(
     perturbation_ids: torch.Tensor | int | None = None,
     query_gene_fallback_ids: torch.Tensor | None = None,
     query_gene_baseline: torch.Tensor | None = None,
+    query_read_depth: torch.Tensor | None = None,
     cell_chunk_size: int = 256,
     gene_chunk_size: int = 512,
     concentration: float | None = None,
@@ -144,6 +160,7 @@ def predict_vcc_pooled_counts(
     selected = control_embeddings.index_select(0, flat_indices)
     selected_perturbations = perturbation_embeddings
     selected_perturbation_ids = perturbation_ids
+    selected_read_depth = query_read_depth
     if (
         perturbation_embeddings.dim() == 2
         and perturbation_embeddings.shape[0] == control_embeddings.shape[0]
@@ -151,6 +168,10 @@ def predict_vcc_pooled_counts(
         selected_perturbations = perturbation_embeddings.index_select(
             0, flat_indices.to(perturbation_embeddings.device)
         )
+    if query_read_depth is not None:
+        depth = torch.as_tensor(query_read_depth, device=control_embeddings.device)
+        if depth.dim() > 0 and depth.shape[0] == control_embeddings.shape[0]:
+            selected_read_depth = depth.index_select(0, flat_indices)
     if perturbation_ids is not None:
         selected_perturbation_ids = torch.as_tensor(
             perturbation_ids, dtype=torch.long, device=control_embeddings.device
@@ -167,6 +188,7 @@ def predict_vcc_pooled_counts(
         perturbation_ids=selected_perturbation_ids,
         query_gene_fallback_ids=query_gene_fallback_ids,
         query_gene_baseline=query_gene_baseline,
+        query_read_depth=selected_read_depth,
         cell_chunk_size=cell_chunk_size,
         gene_chunk_size=gene_chunk_size,
     )

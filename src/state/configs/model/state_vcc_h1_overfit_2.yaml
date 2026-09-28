@@ -1,0 +1,12 @@
+defaults:
+  - state_vcc_effect_pds_focused
+  - _self_
+
+kwargs:
+  cell_set_len: 64
+  pds_memory_bank_size: 2
+  optimizer_group_lrs:
+    backbone: 1.0e-4
+    perturbation_encoder: 1.0e-3
+    decoder: 5.0e-4
+    fallback: 5.0e-4

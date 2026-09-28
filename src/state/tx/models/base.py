@@ -478,7 +478,11 @@ class PerturbationModel(ABC, LightningModule):
                 group = "fallback"
             elif name.startswith("gene_decoder."):
                 group = "decoder"
-            elif name.startswith("pert_encoder.") or name.startswith("perturbation_residual."):
+            elif (
+                name.startswith("pert_encoder.")
+                or name.startswith("perturbation_residual.")
+                or name.startswith("perturbation_embedding.")
+            ):
                 group = "perturbation_encoder"
             else:
                 group = "backbone"

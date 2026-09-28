@@ -46,23 +46,31 @@ class ConciseProgressCallback(Callback):
 
         train_loss = scalar("train_loss")
         decoder_loss = scalar("decoder_loss")
+        pds_surrogate_loss = scalar("train/pds_surrogate_loss")
         gradient_norm = scalar("train/gradient_norm")
+        pert_gradient_norm = scalar("train/gradient_norm_perturbation_encoder")
         decoder_weight = float(getattr(pl_module, "decoder_loss_weight", 1.0))
-        total_loss = (
-            train_loss + decoder_weight * decoder_loss
-            if train_loss is not None and decoder_loss is not None
-            else None
-        )
+        total_loss = scalar("train/total_loss")
+        if total_loss is None and not getattr(pl_module, "pds_only", False):
+            total_loss = (
+                train_loss + decoder_weight * decoder_loss
+                if train_loss is not None and decoder_loss is not None
+                else None
+            )
 
         loss_text = ""
         if train_loss is not None:
             loss_text += f" train_loss={train_loss:.6f}"
         if decoder_loss is not None:
             loss_text += f" decoder_loss={decoder_loss:.6f}"
+        if pds_surrogate_loss is not None:
+            loss_text += f" pds_surrogate={pds_surrogate_loss:.6f}"
         if total_loss is not None:
             loss_text += f" total_loss={total_loss:.6f}"
         if gradient_norm is not None:
             loss_text += f" gradient_norm={gradient_norm:.4f}"
+        if pert_gradient_norm is not None:
+            loss_text += f" pert_grad={pert_gradient_norm:.4f}"
         rank_zero_info(
             "TRAIN_PROGRESS optimizer_step=%d/%d optimizer_steps_per_second=%.4f eta_hours=%.2f%s",
             step,

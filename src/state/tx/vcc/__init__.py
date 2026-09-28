@@ -14,6 +14,8 @@ from .submission import (
     VCCPredictionWriter,
     build_vcc_control_pool,
     control_log_cp10k_baseline,
+    control_log_cp10k_rows,
+    control_log_cp10k_read_depth,
 )
 from .focus_data import (
     FocusDatasetSpec,
@@ -38,6 +40,8 @@ __all__ = [
     "VCCPredictionWriter",
     "build_vcc_control_pool",
     "control_log_cp10k_baseline",
+    "control_log_cp10k_rows",
+    "control_log_cp10k_read_depth",
     "FocusDatasetSpec",
     "default_focus_dataset_specs",
     "inspect_focus_datasets",

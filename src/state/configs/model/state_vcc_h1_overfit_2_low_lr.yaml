@@ -1,0 +1,10 @@
+defaults:
+  - state_vcc_h1_overfit_2
+  - _self_
+
+kwargs:
+  optimizer_group_lrs:
+    backbone: 1.0e-5
+    perturbation_encoder: 5.0e-5
+    decoder: 2.0e-5
+    fallback: 2.0e-5

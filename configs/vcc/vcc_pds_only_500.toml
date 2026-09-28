@@ -1,0 +1,38 @@
+[pipeline]
+gpu = "2"
+python = "external/state-env/bin/python"
+num_workers = 4
+batch_size = 4
+gradient_accumulation = 1
+data_config = "vcc_panel_free_paper"
+model_config = "state_vcc_pds_only"
+
+[training]
+stages = ["h1-loco-joint"]
+
+[training.max_steps]
+h1-loco-joint = 500
+
+[training.val_freq]
+h1-loco-joint = 100
+
+[training.init_from]
+h1-loco-joint = "external/ST-SE-Tahoe/zeroshot/state_generalization_zeroshot_X_state/checkpoints/best.ckpt"
+
+[inference]
+enabled = false
+
+[evaluation]
+enabled = true
+source_stage = "h1-loco-joint"
+checkpoint = "best.ckpt"
+gpu = "2"
+max_cells_per_pert = 400
+cell_chunk_size = 256
+gene_chunk_size = 512
+cell_eval_root = "../cell-eval2"
+# Evaluate only H1 perturbations observed in non-H1 training datasets.
+shared_nonzero_only = true
+
+[submission]
+wait = false

@@ -45,6 +45,12 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         decoder_fallback_gene_names_file: str | None = None,
         trainable_perturbation_names_file: str | None = None,
         decoder_control_residual: bool = False,
+        decoder_read_depth: bool = False,
+        decoder_shared_batch_panel: bool = False,
+        decoder_exclude_gene_names_file: str | None = None,
+        group_batches_by_dataset: bool = False,
+        set_group_by_batch: bool | None = None,
+        focus_perturbations_file: str | None = None,
         balance_datasets: bool = True,
         balance_perturbations: bool = True,
         sets_per_dataset_per_epoch: int | None = 2048,
@@ -78,6 +84,28 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         self.decoder_fallback_gene_names_file = decoder_fallback_gene_names_file
         self.trainable_perturbation_names_file = trainable_perturbation_names_file
         self.decoder_control_residual = bool(decoder_control_residual)
+        self.decoder_read_depth = bool(decoder_read_depth)
+        self.decoder_shared_batch_panel = bool(decoder_shared_batch_panel)
+        self.decoder_exclude_gene_names_file = decoder_exclude_gene_names_file
+        self.decoder_exclude_gene_names = set(
+            load_gene_name_list(decoder_exclude_gene_names_file)
+            if decoder_exclude_gene_names_file else []
+        )
+        self.group_batches_by_dataset = bool(group_batches_by_dataset)
+        # Keep control mapping batch-matched while optionally assembling a
+        # perturbation Set across batches. Small H1 batch x target groups
+        # otherwise repeat only a handful of cells up to cell_sentence_len.
+        self.set_group_by_batch = (
+            kwargs.get("basal_mapping_strategy") == "batch"
+            if set_group_by_batch is None else bool(set_group_by_batch)
+        )
+        self.focus_perturbations_file = focus_perturbations_file
+        self.focus_perturbations = (
+            load_gene_name_list(focus_perturbations_file)
+            if focus_perturbations_file else []
+        )
+        self._shared_decoder_names: list[str] = []
+        self._shared_panel_indices: dict[str, list[int]] = {}
         self.balance_datasets = bool(balance_datasets)
         self.balance_perturbations = bool(balance_perturbations)
         self.sets_per_dataset_per_epoch = sets_per_dataset_per_epoch
@@ -146,6 +174,30 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             previous = self._panel_names.setdefault(source.name, names)
             if previous != names:
                 raise ValueError(f"Dataset {source.name!r} contains files with inconsistent gene panels")
+        if self.decoder_shared_batch_panel:
+            common = set.intersection(*(set(names) for names in self._panel_names.values()))
+            common.difference_update(self.decoder_exclude_gene_names)
+            eligible = [
+                name for name in sorted(common)
+                if (
+                    name in self.decoder_fallback_gene_to_id
+                    or (
+                        name in self.pert_onehot_map
+                        and torch.as_tensor(self.pert_onehot_map[name]).abs().sum().item() > 0
+                    )
+                )
+            ]
+            if len(eligible) < 2:
+                raise ValueError("Shared decoder panel has fewer than two supported genes")
+            panel_generator = torch.Generator().manual_seed(self.decoder_generator.initial_seed())
+            order = torch.randperm(len(eligible), generator=panel_generator)
+            self._shared_decoder_names = [eligible[int(index)] for index in order[:self.max_decoder_genes]]
+            self._shared_panel_indices = {}
+            for dataset_name, names in self._panel_names.items():
+                lookup = {name: index for index, name in enumerate(names)}
+                self._shared_panel_indices[dataset_name] = [
+                    lookup[gene] for gene in self._shared_decoder_names
+                ]
 
     def _select_gene_indices(
         self,
@@ -227,8 +279,12 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         set_embeddings = []
         set_fallback_ids = []
         set_baselines = []
+        set_read_depths = []
         set_names = []
         set_perturbation_ids = []
+        set_dataset_names = []
+        set_pert_library_sizes = []
+        set_ctrl_library_sizes = []
         for start in range(0, len(samples), self.cell_sentence_len):
             set_samples = samples[start : start + self.cell_sentence_len]
             dataset_names = {sample["dataset_name"] for sample in set_samples}
@@ -237,6 +293,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                     "Every cell set must come from one dataset; got " + ", ".join(sorted(dataset_names))
                 )
             dataset_name = next(iter(dataset_names))
+            set_dataset_names.append(dataset_name)
             if dataset_name not in self._panel_names:
                 raise KeyError(f"No native gene panel registered for dataset {dataset_name!r}")
 
@@ -272,6 +329,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
 
             # All normalization denominators use the complete native panel.
             totals = raw_counts.sum(dim=-1, keepdim=True)
+            set_pert_library_sizes.append(totals.squeeze(-1))
             scale = torch.where(
                 totals > 0,
                 self.decoder_target_sum / totals,
@@ -282,6 +340,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                 if self.is_log1p:
                     ctrl_raw_counts = torch.expm1(ctrl_raw_counts).clamp_min(0)
                 ctrl_totals = ctrl_raw_counts.sum(dim=-1, keepdim=True)
+                set_ctrl_library_sizes.append(ctrl_totals.squeeze(-1))
                 ctrl_scale = torch.where(
                     ctrl_totals > 0,
                     self.decoder_target_sum / ctrl_totals,
@@ -290,9 +349,26 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             else:
                 ctrl_scale = None
 
+            if getattr(self, "decoder_read_depth", False):
+                if ctrl_raw_counts is None or ctrl_scale is None:
+                    raise KeyError(
+                        "decoder_read_depth=True requires store_raw_basal=True "
+                        "so matched ctrl_cell_counts are available"
+                    )
+                # Paper-compatible scalar: mean log1p(CP10K) over genes that
+                # are expressed in the input/control cell.  It is supplied to
+                # the decoder as a per-cell read-depth/context feature.
+                ctrl_log = torch.log1p(ctrl_raw_counts * ctrl_scale)
+                expressed = ctrl_raw_counts > 0
+                set_read_depths.append(
+                    (ctrl_log * expressed).sum(dim=-1)
+                    / expressed.sum(dim=-1).clamp_min(1)
+                )
+
             differential_scores = None
             if (
-                float(getattr(self, "decoder_deg_fraction", 0.0)) > 0
+                not getattr(self, "decoder_shared_batch_panel", False)
+                and float(getattr(self, "decoder_deg_fraction", 0.0)) > 0
                 and perturbation != control_perturbation
             ):
                 if ctrl_raw_counts is None or ctrl_scale is None:
@@ -321,10 +397,14 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                     ctrl_mean <= min_control, float("-inf")
                 )
 
-            indices = self._select_gene_indices(
-                names,
-                required_names=required_names,
-                differential_scores=differential_scores,
+            indices = (
+                self._shared_panel_indices[dataset_name]
+                if getattr(self, "decoder_shared_batch_panel", False)
+                else self._select_gene_indices(
+                    names,
+                    required_names=required_names,
+                    differential_scores=differential_scores,
+                )
             )
             index_tensor = torch.tensor(indices, dtype=torch.long)
             selected_counts = raw_counts.index_select(-1, index_tensor)
@@ -337,7 +417,11 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                     )
                 ctrl_selected = ctrl_raw_counts.index_select(-1, index_tensor)
                 assert ctrl_scale is not None
-                set_baselines.append(torch.log1p(ctrl_selected * ctrl_scale).mean(dim=0))
+                # Keep one baseline per matched donor cell.  A Set-mean log
+                # baseline destroys control-cell heterogeneity and, after
+                # expm1/count reconstruction, creates a large perturbation-
+                # independent pseudobulk shift (Jensen's inequality).
+                set_baselines.append(torch.log1p(ctrl_selected * ctrl_scale))
             selected_names = [names[index] for index in indices]
             set_names.append(selected_names)
             embedding_dim = int(torch.as_tensor(next(iter(self.pert_onehot_map.values()))).numel())
@@ -376,8 +460,13 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         gene_embeddings = torch.zeros(batch_sets, max_genes, embedding_dim)
         gene_fallback_ids = torch.full((batch_sets, max_genes), -1, dtype=torch.long)
         gene_baselines = (
-            torch.zeros(batch_sets, max_genes)
+            torch.zeros(batch_sets, self.cell_sentence_len, max_genes)
             if getattr(self, "decoder_control_residual", False)
+            else None
+        )
+        decoder_read_depth = (
+            torch.zeros(batch_sets, self.cell_sentence_len, 1)
+            if getattr(self, "decoder_read_depth", False)
             else None
         )
         padded_names: list[list[str | None]] = []
@@ -390,7 +479,9 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             gene_embeddings[set_index, :width] = embeddings
             gene_fallback_ids[set_index, :width] = fallback_ids
             if gene_baselines is not None:
-                gene_baselines[set_index, :width] = set_baselines[set_index]
+                gene_baselines[set_index, :, :width] = set_baselines[set_index]
+            if decoder_read_depth is not None:
+                decoder_read_depth[set_index, :, 0] = set_read_depths[set_index]
             padded_names.append(names + [None] * (max_genes - width))
 
         merged.update(
@@ -400,8 +491,12 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                 "gene_targets": gene_targets,
                 "gene_mask": gene_mask,
                 "gene_names": padded_names,
+                "set_dataset_names": set_dataset_names,
+                "decoder_pert_library_sizes": torch.stack(set_pert_library_sizes),
             }
         )
+        if len(set_ctrl_library_sizes) == batch_sets:
+            merged["decoder_ctrl_library_sizes"] = torch.stack(set_ctrl_library_sizes)
         if getattr(self, "trainable_perturbation_to_id", {}):
             # Match cell-load's flattened [B*S, ...] ST inputs. Every cell in a
             # Set receives the same target ID; control is the sentinel -1.
@@ -410,6 +505,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             ).repeat_interleave(self.cell_sentence_len)
         if gene_baselines is not None:
             merged["gene_baselines"] = gene_baselines
+        if decoder_read_depth is not None:
+            merged["decoder_read_depth"] = decoder_read_depth
         return merged
 
     def get_var_dims(self):
@@ -427,7 +524,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             drop_last=self.drop_last,
             cell_sentence_len=self.cell_sentence_len,
             test=test,
-            use_batch=self.basal_mapping_strategy == "batch",
+            use_batch=self.set_group_by_batch,
             use_consecutive_loading=self.use_consecutive_loading,
             downsample_cells=self.downsample_cells,
             seed=self.random_seed,
@@ -440,6 +537,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             ),
             control_perturbation=getattr(self, "control_pert", None),
             control_only_sets_per_epoch=self.control_only_sets_per_epoch,
+            group_batches_by_dataset=self.group_batches_by_dataset and not test,
+            focus_perturbations=self.focus_perturbations if not validation and not test else None,
         )
         return DataLoader(
             dataset,
@@ -480,6 +579,11 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                     getattr(self, "decoder_deg_min_control_cpm", 5.0)
                 ),
                 "decoder_fallback_gene_names_file": self.decoder_fallback_gene_names_file,
+                "decoder_shared_batch_panel": getattr(self, "decoder_shared_batch_panel", False),
+                "decoder_exclude_gene_names_file": getattr(self, "decoder_exclude_gene_names_file", None),
+                "group_batches_by_dataset": getattr(self, "group_batches_by_dataset", False),
+                "set_group_by_batch": getattr(self, "set_group_by_batch", None),
+                "focus_perturbations_file": getattr(self, "focus_perturbations_file", None),
                 "decoder_fallback_gene_names": list(self.decoder_fallback_gene_to_id),
                 "trainable_perturbation_names_file": self.trainable_perturbation_names_file,
                 "trainable_perturbation_names": list(self.trainable_perturbation_to_id),

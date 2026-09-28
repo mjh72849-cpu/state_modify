@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -122,6 +124,7 @@ class Tracker:
         *,
         dry_run: bool = False,
         capture: bool = False,
+        log_markers: bool = True,
     ) -> str:
         log_dir = LOG_ROOT / category
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +142,8 @@ class Tracker:
         started = time.monotonic()
         tail: deque[str] = deque(maxlen=500)
         with log_path.open("a", buffering=1) as log:
-            log.write(f"\n[{utc_now()}] START {printable}\n")
+            if log_markers:
+                log.write(f"\n[{utc_now()}] START {printable}\n")
             process = subprocess.Popen(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, bufsize=1,
@@ -152,7 +156,8 @@ class Tracker:
                     tail.append(line)
             return_code = process.wait()
             elapsed = time.monotonic() - started
-            log.write(f"[{utc_now()}] END exit={return_code} seconds={elapsed:.3f}\n")
+            if log_markers:
+                log.write(f"[{utc_now()}] END exit={return_code} seconds={elapsed:.3f}\n")
         status = "succeeded" if return_code == 0 else "failed"
         self.set_step(
             name, status=status, ended_at=utc_now(), exit_code=return_code,
@@ -190,6 +195,7 @@ def record_artifact(
 
 def training_command(stage: str, config: dict[str, Any], args: argparse.Namespace) -> list[str]:
     settings = config["pipeline"]
+    training = config["training"]
     command = [
         str(ROOT / "scripts/train_vcc.py"), stage,
         "--gpu", str(args.gpu or settings["gpu"]),
@@ -197,21 +203,38 @@ def training_command(stage: str, config: dict[str, Any], args: argparse.Namespac
         "--batch-size", str(settings["batch_size"]),
         "--gradient-accumulation", str(settings["gradient_accumulation"]),
     ]
-    if args.max_steps is not None:
-        command.extend(["--max-steps", str(args.max_steps)])
+    if settings.get("data_config"):
+        command.extend(["--data-config", str(settings["data_config"])])
+    if settings.get("model_config"):
+        command.extend(["--model-config", str(settings["model_config"])])
+    configured_steps = training.get("max_steps", {}).get(stage)
+    max_steps = args.max_steps if args.max_steps is not None else configured_steps
+    if max_steps is not None:
+        command.extend(["--max-steps", str(max_steps)])
+    configured_val_freq = training.get("val_freq", {}).get(stage)
+    if configured_val_freq is not None:
+        command.extend(["--val-freq", str(configured_val_freq)])
     run_dir = stage_run_dir(stage, args)
     if args.run_suffix:
         command.extend(["--name", run_dir.name])
-    previous = {"h1-loco-joint": "h1-loco-warmup", "full": "h1-loco-joint"}.get(stage)
-    if previous is not None:
-        previous_dir = stage_run_dir(previous, args)
-        candidates = [
-            previous_dir / "checkpoints/best.ckpt",
-            previous_dir / "checkpoints/final.ckpt",
-        ]
-        initialization = next((candidate for candidate in candidates if candidate.is_file()), None)
-        if initialization is None and args.dry_run:
-            initialization = candidates[0]
+    explicit_initialization = training.get("init_from", {}).get(stage)
+    if explicit_initialization:
+        initialization = resolve_repo_path(explicit_initialization)
+        if not initialization.is_file() and not args.dry_run:
+            raise FileNotFoundError(initialization)
+        command.extend(["--init-from", str(initialization)])
+    else:
+        previous = {"h1-loco-joint": "h1-loco-warmup", "full": "h1-loco-joint"}.get(stage)
+        initialization = None
+        if previous is not None:
+            previous_dir = stage_run_dir(previous, args)
+            candidates = [
+                previous_dir / "checkpoints/best.ckpt",
+                previous_dir / "checkpoints/final.ckpt",
+            ]
+            initialization = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if initialization is None and args.dry_run:
+                initialization = candidates[0]
         if initialization is not None:
             command.extend(["--init-from", str(initialization)])
     if args.overwrite:
@@ -281,6 +304,71 @@ def packaging_command(
     return command, output
 
 
+def evaluation_commands(
+    config: dict[str, Any], args: argparse.Namespace
+) -> tuple[list[str], Path, list[str], Path]:
+    settings = config["pipeline"]
+    evaluation = config.get("evaluation", {})
+    python = resolve_repo_path(settings["python"])
+    source_stage = evaluation.get("source_stage", config["inference"].get("source_stage", "full"))
+    run_dir = stage_run_dir(source_stage, args) if args.run_suffix else resolve_repo_path(evaluation["run_dir"])
+    prediction = run_dir / "h1_loco_prediction.h5ad"
+    real_subset = run_dir / "h1_loco_shared_nonzero_real.h5ad"
+    score_dir = run_dir / "h1_loco_metrics"
+    prediction_command = [
+        "env", f"CUDA_VISIBLE_DEVICES={evaluation.get('gpu', args.gpu or settings['gpu'])}",
+        f"PYTHONPATH={ROOT / 'src'}",
+        str(python), str(ROOT / "scripts/evaluate_h1_loco.py"),
+        "--run-dir", str(run_dir),
+        "--checkpoint", str(evaluation.get("checkpoint", "best.ckpt")),
+        "--output", str(prediction),
+        "--real-output", str(real_subset),
+        "--device", "cuda:0",
+        "--max-cells-per-pert", str(evaluation.get("max_cells_per_pert", 400)),
+        "--cell-chunk-size", str(evaluation.get("cell_chunk_size", 256)),
+        "--gene-chunk-size", str(evaluation.get("gene_chunk_size", 512)),
+    ]
+    if args.overwrite:
+        prediction_command.append("--overwrite")
+    cell_eval_root = resolve_repo_path(evaluation.get("cell_eval_root", "../cell-eval2"))
+    score_command = [
+        "env", f"PYTHONPATH={cell_eval_root / 'src'}",
+        # cell_eval2.cli exposes main() as a package entry point but does not
+        # execute it under ``python -m``. Invoke the function explicitly so a
+        # zero-exit no-op cannot be mistaken for a completed evaluation.
+        str(python), "-c", "from cell_eval2.cli import main; main()", "run",
+        "-ap", str(prediction),
+        "-ar", str(real_subset),
+        "--preset", "vcc2026",
+        "--profile", "anndata",
+        "--pert-col", "target_gene",
+        "-o", str(score_dir),
+    ]
+    return prediction_command, prediction, score_command, score_dir / "agg_results.csv"
+
+
+def read_aggregate_metric(path: Path, metric: str, statistic: str = "mean") -> float:
+    """Read one aggregate metric emitted by cell-eval2."""
+    with path.open(newline="") as handle:
+        rows = csv.DictReader(handle)
+        for row in rows:
+            if row.get("statistic") == statistic:
+                if metric not in row:
+                    raise ValueError(f"Metric {metric!r} is absent from {path}")
+                try:
+                    value = float(row[metric])
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Metric {metric!r} statistic {statistic!r} is not numeric in {path}"
+                    ) from error
+                if value != value:  # NaN
+                    raise ValueError(
+                        f"Metric {metric!r} statistic {statistic!r} is NaN in {path}"
+                    )
+                return value
+    raise ValueError(f"Statistic {statistic!r} is absent from {path}")
+
+
 def extract_submission_id(output: str) -> str | None:
     payloads: list[Any] = []
     try:
@@ -304,6 +392,13 @@ def extract_submission_id(output: str) -> str | None:
                 for key in ("entry_id", "submission_id", "id"):
                     if value.get(key) is not None:
                         return str(value[key])
+    matches = re.findall(
+        r"(?:\bentry\s*:|\bsubmitted\s+[—-]\s+entry)\s*([A-Za-z0-9_-]+)",
+        output,
+        flags=re.IGNORECASE,
+    )
+    if matches:
+        return matches[-1]
     return None
 
 
@@ -321,11 +416,14 @@ def submit(tracker: Tracker, vcc_file: Path, config: dict[str, Any], args: argpa
         executable, "submit", str(vcc_file),
         "--model-name", str(args.model_name or settings["model_name"]),
         "--description", str(args.description or settings.get("description", "")),
-        "--json",
     ]
     if args.wait_submission or settings.get("wait", False):
         command.extend(["--wait", "--poll-interval", str(settings.get("poll_interval", 30.0))])
-    response = tracker.run("submission", command, "submission", capture=True)
+    # Preserve the official human-readable stream verbatim so this log contains
+    # upload progress, scoring transitions, rank, and final metric values.
+    response = tracker.run(
+        "submission", command, "submission", capture=True, log_markers=False
+    )
     submission_id = extract_submission_id(response)
     tracker.state["submission"] = {
         "id": submission_id,
@@ -363,6 +461,66 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 dry_run=args.dry_run,
             )
             record_artifact(tracker, f"train_{stage}", artifact, dry_run=args.dry_run)
+
+        evaluation = config.get("evaluation", {})
+        if evaluation.get("enabled", False) and not args.skip_evaluation:
+            pred_command, local_prediction, score_command, score_artifact = evaluation_commands(
+                config, args
+            )
+            if args.resume and tracker.completed("h1_loco_prediction", local_prediction):
+                print("[h1_loco_prediction] already completed; skipping", flush=True)
+            else:
+                tracker.run("h1_loco_prediction", pred_command, "evaluation", dry_run=args.dry_run)
+                record_artifact(tracker, "h1_loco_prediction", local_prediction, dry_run=args.dry_run)
+            if args.resume and tracker.completed("h1_loco_pds", score_artifact):
+                print("[h1_loco_pds] already completed; skipping", flush=True)
+            else:
+                tracker.run("h1_loco_pds", score_command, "evaluation", dry_run=args.dry_run)
+                record_artifact(tracker, "h1_loco_pds", score_artifact, dry_run=args.dry_run)
+
+            # Avoid spending hours on full VCC inference and packaging when the
+            # held-out-context model cannot distinguish perturbations. PDS is a
+            # rank-style score with random performance near 0.5.
+            min_pds = evaluation.get("min_pds_cosine")
+            if min_pds is not None and not args.dry_run:
+                pds = read_aggregate_metric(score_artifact, "pds_cosine")
+                passed = pds >= float(min_pds)
+                tracker.set_step(
+                    "pds_gate",
+                    status="succeeded",
+                    metric="pds_cosine",
+                    value=pds,
+                    minimum=float(min_pds),
+                    decision="continue" if passed else "stop",
+                    ended_at=utc_now(),
+                )
+                tracker.event(
+                    "evaluation_gate",
+                    metric="pds_cosine",
+                    value=pds,
+                    minimum=float(min_pds),
+                    decision="continue" if passed else "stop",
+                )
+                if not passed:
+                    for downstream in ("inference", "packaging"):
+                        tracker.set_step(
+                            downstream,
+                            status="skipped_low_pds",
+                            reason=(
+                                f"pds_cosine {pds:.6f} is below the configured "
+                                f"minimum {float(min_pds):.6f}"
+                            ),
+                            ended_at=utc_now(),
+                        )
+                    tracker.state["status"] = "stopped_low_pds"
+                    tracker.state["ended_at"] = utc_now()
+                    tracker.save()
+                    print(
+                        f"[pds_gate] pds_cosine={pds:.6f} < {float(min_pds):.6f}; "
+                        "stopping before VCC inference and packaging",
+                        flush=True,
+                    )
+                    return
 
         vcc_output: Path | None = None
         if config["inference"].get("enabled", True) and not args.skip_inference:
@@ -458,6 +616,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--from-stage", choices=tuple(TRAIN_RUNS))
     run.add_argument("--through-stage", choices=tuple(TRAIN_RUNS))
     run.add_argument("--skip-training", action="store_true")
+    run.add_argument("--skip-evaluation", action="store_true")
     run.add_argument("--skip-inference", action="store_true")
     run.add_argument("--smoke-targets", type=int)
     run.add_argument("--output")

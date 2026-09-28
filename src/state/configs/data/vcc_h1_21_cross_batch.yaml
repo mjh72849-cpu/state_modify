@@ -1,0 +1,8 @@
+defaults:
+  - vcc_panel_free_effect_pds
+  - _self_
+
+kwargs:
+  focus_perturbations_file: assets/vcc_h1_shared_21.txt
+  set_group_by_batch: false
+  sets_per_dataset_per_epoch: 1024

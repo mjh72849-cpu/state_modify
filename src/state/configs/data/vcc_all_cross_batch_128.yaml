@@ -1,0 +1,9 @@
+defaults:
+  - vcc_panel_free_effect_pds
+  - _self_
+
+kwargs:
+  # Keep each perturbation Set free to pool cells across native experimental
+  # batches; basal controls remain matched by the native batch.
+  set_group_by_batch: false
+  sets_per_dataset_per_epoch: 1024

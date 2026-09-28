@@ -1,0 +1,83 @@
+name: state
+checkpoint: null
+device: cuda
+
+# Paper-compatible ST + panel-free expression decoder.  Genetic perturbations
+# use the paper's categorical one-hot + Linear representation, implemented as
+# a trainable ID Embedding lookup (the memory-efficient equivalent of one-hot
+# multiplied by a weight matrix).  The default state_vcc profile is unchanged.
+kwargs:
+  cell_set_len: 256
+  blur: 0.05
+  hidden_dim: 768
+  loss: energy
+  distributional_loss: energy
+  n_encoder_layers: 1
+  n_decoder_layers: 1
+  predict_residual: true
+  softplus: true
+  freeze_pert_backbone: false
+  freeze_pretrained_backbone: false
+  finetune_vci_decoder: false
+  gene_decoder_bool: true
+  decoder_weight: 0.1
+  # The paper's decoder predicts expression directly from z_pert; it does not
+  # subtract a second decoder evaluation at z_control.
+  control_calibrated_decoder: false
+  # Keep the published objective for this reproduction profile.  The VCC
+  # effect-calibration terms remain available in state_vcc.yaml instead.
+  latent_effect_cosine_weight: 0.0
+  latent_effect_magnitude_weight: 0.0
+  latent_contrastive_weight: 0.0
+  latent_contrastive_temperature: 0.10
+  decoder_effect_cosine_weight: 0.0
+  perturbation_representation: identity
+  detach_decoder: false
+  gene_decoder_chunk_size: 512
+  optimizer_weight_decay: 0.0005
+  optimizer_group_lrs:
+    backbone: 1.0e-5
+    perturbation_encoder: 5.0e-5
+    decoder: 2.0e-5
+    fallback: 2.0e-5
+  batch_encoder: false
+  use_batch_token: false
+  mask_attn: false
+  embed_key: X_state
+  init_from: null
+
+  panel_free_decoder_cfg:
+    gene_embedding_dim: 5120
+    hidden_dim: 256
+    n_layers: 2
+    dropout: 0.1
+    fusion_mode: concat
+    use_gene_baseline: false
+    use_read_depth: true
+    predict_residual: false
+    output_activation: identity
+    num_fallback_genes: 343
+
+  transformer_backbone_key: llama
+  transformer_backbone_kwargs:
+    bidirectional_attention: true
+    max_position_embeddings: ${model.kwargs.cell_set_len}
+    hidden_size: ${model.kwargs.hidden_dim}
+    intermediate_size: 3072
+    num_hidden_layers: 8
+    num_attention_heads: 12
+    num_key_value_heads: 12
+    head_dim: 64
+    use_cache: false
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    layer_norm_eps: 1e-6
+    pad_token_id: 0
+    bos_token_id: 1
+    eos_token_id: 2
+    tie_word_embeddings: false
+    rotary_dim: 0
+    use_rotary_embeddings: false
+
+  lora:
+    enable: false

@@ -13,6 +13,16 @@ written to `runs/pipelines/<pipeline-id>/state.json`, an append-only event
 stream to `events.jsonl`, and complete command output to category-specific
 files below `logs/`. Runtime files are ignored by Git.
 
+After the low-PDS frozen warm-up probe, the recommended first rerun is
+`configs/vcc/vcc_paper_like_submit.toml`. It trains the warm-up and the joint
+fine-tuning stage, then infers from the joint stage's validation-selected
+`best.ckpt`; it does not submit the frozen warm-up checkpoint by itself.
+
+```bash
+scripts/vcc_tmux_pipeline.sh start paper_like_v1 \
+  --profile paper-like --gpu 0 --confirm-submit
+```
+
 ## Inspect the production plan
 
 This creates a local plan record but executes no training, inference, package,
@@ -113,7 +123,11 @@ external/state-env/bin/python scripts/vcc_pipeline.py run \
 ```
 
 The pipeline first runs `vcc whoami`, then submits the existing `.vcc` and
-records the returned entry ID when the installed CLI returns it as JSON.
+records the returned entry ID from the official CLI output. The main
+`logs/submission/<pipeline-id>__submission.log` preserves that human-readable
+output verbatim, including upload percentage/speed/ETA, scoring status, final
+rank, and metric values. Machine-readable state remains in
+`runs/pipelines/<pipeline-id>/state.json`.
 Authentication remains in the official VCC CLI credential store; tokens are
 not copied into pipeline state or logs by this code.
 

@@ -1,0 +1,6 @@
+defaults:
+  - vcc_h1_overfit_2
+  - _self_
+
+kwargs:
+  set_group_by_batch: true

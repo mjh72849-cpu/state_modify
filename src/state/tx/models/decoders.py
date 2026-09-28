@@ -38,6 +38,7 @@ class PanelFreeGeneDecoder(nn.Module):
         num_fallback_genes: int = 0,
         fusion_mode: str = "add",
         use_gene_baseline: bool = False,
+        use_read_depth: bool = False,
         predict_residual: bool = False,
     ):
         super().__init__()
@@ -49,6 +50,8 @@ class PanelFreeGeneDecoder(nn.Module):
             raise ValueError("fusion_mode must be one of: add, concat")
         if use_gene_baseline and fusion_mode != "concat":
             raise ValueError("use_gene_baseline requires fusion_mode='concat'")
+        if use_read_depth and fusion_mode != "concat":
+            raise ValueError("use_read_depth requires fusion_mode='concat'")
         if predict_residual and not use_gene_baseline:
             raise ValueError("predict_residual requires use_gene_baseline=True")
 
@@ -59,6 +62,7 @@ class PanelFreeGeneDecoder(nn.Module):
         self.num_fallback_genes = int(num_fallback_genes)
         self.fusion_mode = fusion_mode
         self.use_gene_baseline = bool(use_gene_baseline)
+        self.use_read_depth = bool(use_read_depth)
         self.predict_residual = bool(predict_residual)
         if self.num_fallback_genes < 0:
             raise ValueError("num_fallback_genes cannot be negative")
@@ -77,6 +81,8 @@ class PanelFreeGeneDecoder(nn.Module):
 
         head_dim = self.hidden_dim if fusion_mode == "add" else 2 * self.hidden_dim
         if self.use_gene_baseline:
+            head_dim += 1
+        if self.use_read_depth:
             head_dim += 1
         layers = []
         for _ in range(n_layers - 1):
@@ -162,6 +168,32 @@ class PanelFreeGeneDecoder(nn.Module):
             f"for latent shape {tuple(latent.shape)} and G={n_genes}; got {tuple(gene_baseline.shape)}"
         )
 
+    @staticmethod
+    def _expand_read_depth(read_depth: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        """Broadcast the paper's scalar per-cell depth feature to ``[B,S,1]``."""
+        batch_size, seq_len, _ = latent.shape
+        value = read_depth.to(device=latent.device, dtype=latent.dtype)
+        if value.dim() == 0:
+            return value.reshape(1, 1, 1).expand(batch_size, seq_len, 1)
+        if value.dim() == 1:
+            if value.shape[0] == batch_size:
+                return value[:, None, None].expand(-1, seq_len, -1)
+            if value.shape[0] == batch_size * seq_len:
+                return value.reshape(batch_size, seq_len, 1)
+        if value.dim() == 2:
+            if value.shape == (batch_size, seq_len):
+                return value.unsqueeze(-1)
+            if value.shape == (batch_size, 1):
+                return value[:, None].expand(-1, seq_len, -1)
+            if value.shape == (batch_size * seq_len, 1):
+                return value.reshape(batch_size, seq_len, 1)
+        if value.dim() == 3 and value.shape == (batch_size, seq_len, 1):
+            return value
+        raise ValueError(
+            "read_depth must have shape scalar, [B], [B,1], [B*S], [B*S,1], "
+            f"[B,S], or [B,S,1] for latent shape {tuple(latent.shape)}; got {tuple(value.shape)}"
+        )
+
     def forward(
         self,
         latent: torch.Tensor,
@@ -169,6 +201,7 @@ class PanelFreeGeneDecoder(nn.Module):
         *,
         fallback_ids: Optional[torch.Tensor] = None,
         gene_baseline: Optional[torch.Tensor] = None,
+        read_depth: Optional[torch.Tensor] = None,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         """Return expression with shape ``[B, S, G]``."""
@@ -198,6 +231,11 @@ class PanelFreeGeneDecoder(nn.Module):
             expanded_baseline = self._expand_gene_baseline(
                 gene_baseline.to(device=latent.device, dtype=latent.dtype), latent, n_genes
             )
+        expanded_read_depth = None
+        if self.use_read_depth:
+            if read_depth is None:
+                raise ValueError("read_depth is required when use_read_depth=True")
+            expanded_read_depth = self._expand_read_depth(read_depth, latent)
         expanded_fallback_ids = None
         if fallback_ids is not None:
             expanded_fallback_ids = self._expand_fallback_ids(
@@ -228,12 +266,64 @@ class PanelFreeGeneDecoder(nn.Module):
                 parts = [expanded_cells, gene_features]
                 if expanded_baseline is not None:
                     parts.append(expanded_baseline[..., start : start + chunk_size, None])
+                if expanded_read_depth is not None:
+                    parts.append(
+                        expanded_read_depth.unsqueeze(-2).expand(
+                            -1, -1, gene_features.shape[-2], -1
+                        )
+                    )
                 fused = torch.cat(parts, dim=-1)
             values = self.shared_head(fused).squeeze(-1)
             if self.predict_residual:
                 values = values + expanded_baseline[..., start : start + chunk_size]
             outputs.append(self._activate(values))
         return torch.cat(outputs, dim=-1)
+
+    def forward_control_calibrated(
+        self,
+        latent: torch.Tensor,
+        control_latent: torch.Tensor,
+        gene_embeddings: torch.Tensor,
+        *,
+        fallback_ids: Optional[torch.Tensor] = None,
+        gene_baseline: Optional[torch.Tensor] = None,
+        read_depth: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Decode a perturbation after cancelling the decoder's control bias.
+
+        The same shared decoder is evaluated on the predicted perturbed state
+        and its matched control state.  Their difference is added to the
+        measured control baseline, so any gene- or dataset-wide residual that
+        is independent of the perturbation cancels exactly.
+        """
+        if not self.use_gene_baseline or gene_baseline is None:
+            raise ValueError(
+                "control-calibrated decoding requires use_gene_baseline=True "
+                "and gene_baseline"
+            )
+        perturbed = self.forward(
+            latent,
+            gene_embeddings,
+            fallback_ids=fallback_ids,
+            gene_baseline=gene_baseline,
+            read_depth=read_depth,
+            chunk_size=chunk_size,
+        )
+        control = self.forward(
+            control_latent,
+            gene_embeddings,
+            fallback_ids=fallback_ids,
+            gene_baseline=gene_baseline,
+            read_depth=read_depth,
+            chunk_size=chunk_size,
+        )
+        expanded_baseline = self._expand_gene_baseline(
+            gene_baseline.to(device=latent.device, dtype=latent.dtype),
+            latent if latent.dim() == 3 else latent.unsqueeze(0),
+            perturbed.shape[-1],
+        )
+        return expanded_baseline + perturbed - control
 
 
 class FinetuneVCICountsDecoder(nn.Module):

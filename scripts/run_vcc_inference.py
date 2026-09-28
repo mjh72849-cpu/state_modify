@@ -31,6 +31,8 @@ from state.tx.vcc import (
     VCCPredictionWriter,
     build_gene_query_features,
     canonical_gene_name,
+    control_log_cp10k_read_depth,
+    control_log_cp10k_rows,
     load_gene_name_list,
     predict_vcc_pooled_counts,
 )
@@ -237,8 +239,7 @@ def main() -> None:
             pool = np.load(args.prepared_controls / f"context_{context}.pool.npz")
             donor_indices = np.asarray(pool["donor_indices"], dtype=np.int64)
             library_sizes = torch.from_numpy(np.asarray(pool["library_sizes"], dtype=np.int64)).to(device)
-            baseline = torch.from_numpy(np.asarray(pool["log_cp10k_baseline"], dtype=np.float32)).to(device)
-            if donor_indices.shape != (400, 4) or baseline.shape != (18_533,):
+            if donor_indices.shape != (400, 4):
                 raise ValueError(f"Context {context}: invalid prepared pooling artifacts")
             controls = ad.read_h5ad(
                 args.prepared_controls / f"context_{context}.xstate.h5ad", backed="r"
@@ -247,9 +248,22 @@ def main() -> None:
                 selected = np.asarray(
                     controls.obsm["X_state"][donor_indices.reshape(-1)], dtype=np.float32
                 )
+                # Preserve each donor's own control expression.  A single
+                # mean log-CP10K baseline creates a Jensen/pseudobulk offset
+                # that can dominate the perturbation-specific effect.
+                baseline = control_log_cp10k_rows(
+                    controls.X[donor_indices.reshape(-1)],
+                    target_sum=10_000.0,
+                )
+                read_depth = control_log_cp10k_read_depth(
+                    controls.X[donor_indices.reshape(-1)],
+                    target_sum=10_000.0,
+                )
             finally:
                 controls.file.close()
             control_embeddings = torch.from_numpy(selected).to(device)
+            baseline = torch.from_numpy(baseline).to(device)
+            read_depth = torch.from_numpy(read_depth).to(device)
             local_pool = torch.arange(1_600, device=device).reshape(400, 4)
 
             progress = tqdm(zip(targets, target_names), total=len(targets), desc=f"context {context}")
@@ -267,6 +281,7 @@ def main() -> None:
                     perturbation_ids=model.trainable_perturbation_to_id[target],
                     query_gene_fallback_ids=query_fallback_ids,
                     query_gene_baseline=baseline,
+                    query_read_depth=read_depth,
                     cell_chunk_size=args.cell_chunk_size,
                     gene_chunk_size=args.gene_chunk_size,
                     concentration=args.concentration,

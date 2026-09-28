@@ -1,0 +1,29 @@
+[pipeline]
+gpu = "0"
+python = "external/state-env/bin/python"
+num_workers = 8
+batch_size = 4
+gradient_accumulation = 2
+
+[training]
+# Warm up the new one-hot-equivalent table and decoder, then jointly fine-tune
+# STATE. Never submit the frozen warm-up checkpoint by itself.
+stages = ["h1-loco-warmup", "h1-loco-joint"]
+
+[inference]
+enabled = true
+source_stage = "h1-loco-joint"
+run_dir = "runs/vcc_h1_loco_joint"
+checkpoint = "best.ckpt"
+output = "runs/vcc_h1_loco_joint/prediction.h5ad"
+vcc_output = "runs/vcc_h1_loco_joint/prediction.vcc"
+scratch_dir = "runs/vcc_pack_scratch"
+cell_chunk_size = 256
+gene_chunk_size = 512
+pack = true
+
+[submission]
+model_name = "state-paper-like-joint"
+description = "STATE one-hot-equivalent perturbation embedding with joint ST fine-tuning"
+wait = true
+poll_interval = 30.0

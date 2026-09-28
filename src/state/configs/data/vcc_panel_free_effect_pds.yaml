@@ -1,0 +1,43 @@
+name: PanelFreePerturbationDataModule
+kwargs:
+  toml_config_path: null
+  embed_key: X_state
+  output_space: all
+  pert_rep: onehot
+  basal_rep: sample
+  num_workers: 4
+  pin_memory: true
+  n_basal_samples: 1
+  basal_mapping_strategy: batch
+  should_yield_control_cells: true
+  batch_col: batch
+  pert_col: target_gene
+  cell_type_key: cell_type
+  control_pert: non-targeting
+  map_controls: true
+  perturbation_features_file: external/SE-600M/protein_embeddings.pt
+  trainable_perturbation_names_file: assets/vcc_trainable_perturbations.txt
+  decoder_fallback_gene_names_file: assets/vcc_2026_se_fallback_genes.txt
+  store_raw_basal: true
+  is_log1p: false
+  barcode: true
+  use_consecutive_loading: false
+  drop_last: false
+  val_subsample_fraction: 1.0
+
+  max_decoder_genes: 1024
+  decoder_target_sum: 10000
+  decoder_seed: 42
+  decoder_always_include: []
+  decoder_deg_fraction: 0.0
+  decoder_control_residual: true
+  decoder_read_depth: true
+  decoder_shared_batch_panel: true
+  decoder_exclude_gene_names_file: assets/vcc_2026_perturbation_targets.csv
+
+  balance_datasets: true
+  balance_perturbations: true
+  group_batches_by_dataset: true
+  sets_per_dataset_per_epoch: 2048
+  validation_sets_per_dataset: 256
+  control_only_sets_per_epoch: 64

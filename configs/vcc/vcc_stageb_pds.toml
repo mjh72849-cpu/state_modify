@@ -1,0 +1,64 @@
+[pipeline]
+# The balanced Set sampler is single-process. GPU 2 trains; a second free GPU
+# may be used for evaluation/inference after training, but not unsafe DDP.
+gpu = "2"
+python = "external/state-env/bin/python"
+num_workers = 8
+batch_size = 4
+gradient_accumulation = 2
+
+[training]
+# Skip Stage A as requested. Stage B starts directly from ST-SE-Tahoe, keeps
+# the ST backbone unfrozen, and keeps the existing perturbation encoder while
+# training the panel-free decoder and effect-calibration terms. decoder_weight=5
+# is in state_vcc.yaml.
+stages = ["h1-loco-joint"]
+
+[training.max_steps]
+# 8k optimizer updates = 64k sampled Sets at batch 4 x accumulation 2.
+h1-loco-joint = 8000
+
+[training.val_freq]
+# PDS-oriented diagnostics and validation loss every 1k optimizer updates.
+h1-loco-joint = 1000
+
+[training.init_from]
+# Direct Stage-B initialization: no Stage-A checkpoint is consumed.
+h1-loco-joint = "external/ST-SE-Tahoe/zeroshot/state_generalization_zeroshot_X_state/checkpoints/best.ckpt"
+
+[inference]
+enabled = true
+source_stage = "h1-loco-joint"
+run_dir = "runs/vcc_h1_loco_joint_stageb_pds"
+checkpoint = "best.ckpt"
+output = "runs/vcc_h1_loco_joint_stageb_pds/prediction.h5ad"
+vcc_output = "runs/vcc_h1_loco_joint_stageb_pds/prediction.vcc"
+scratch_dir = "runs/vcc_pack_scratch"
+cell_chunk_size = 256
+gene_chunk_size = 512
+pack = true
+
+[evaluation]
+# H1 perturbations are never used as Stage-B targets, so this is a genuine
+# leave-one-context-out check of perturbation discrimination.
+enabled = true
+source_stage = "h1-loco-joint"
+run_dir = "runs/vcc_h1_loco_joint_stageb_pds"
+checkpoint = "best.ckpt"
+gpu = "5"
+real_data = "data/prepared/focused/arc_h1_train.focused.xstate.h5ad"
+cell_eval_root = "../cell-eval2"
+max_cells_per_pert = 400
+cell_chunk_size = 256
+gene_chunk_size = 512
+# Stop before costly full VCC inference/packaging unless held-out H1
+# perturbation discrimination is meaningfully above the ~0.50 random level.
+min_pds_cosine = 0.60
+
+[submission]
+# Metadata only. The pipeline never uploads unless --submit and
+# --confirm-submit are both explicitly provided; this run uses neither.
+model_name = "state-stageb-pds"
+description = "Unfrozen ST, trainable perturbation identities, decoder weight 5"
+wait = false
+poll_interval = 30.0

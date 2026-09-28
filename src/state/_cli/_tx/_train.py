@@ -216,6 +216,7 @@ def run_tx_train(cfg: DictConfig):
         cfg["name"],
         cfg["training"]["val_freq"],
         cfg["training"].get("ckpt_every_n_steps", 4000),
+        cfg["training"].get("checkpoint_monitor", "val_loss"),
     )
     # Add BatchSpeedMonitorCallback to log batches per second to wandb
     batch_speed_monitor = BatchSpeedMonitorCallback()
@@ -358,8 +359,9 @@ def run_tx_train(cfg: DictConfig):
                 model._decoder_externally_configured = True  # Mark that decoder was configured externally
                 print(f"Created new decoder for output_space='{current_output_space}' with gene_dim={new_gene_dim}")
 
+        identity_perturbations = getattr(model, "perturbation_representation", None) == "identity"
         pert_encoder_weight_key = "pert_encoder.0.weight"
-        if pert_encoder_weight_key in checkpoint_state:
+        if not identity_perturbations and pert_encoder_weight_key in checkpoint_state:
             checkpoint_pert_dim = checkpoint_state[pert_encoder_weight_key].shape[1]
 
             # if the cell embedding dim doesn't match, or if it was HVGs, rebuild for transfer learning
@@ -384,6 +386,8 @@ def run_tx_train(cfg: DictConfig):
         # Filter out mismatched size parameters
         filtered_state = {}
         for name, param in checkpoint_state.items():
+            if identity_perturbations and name.startswith("pert_encoder."):
+                continue
             if name in model_state:
                 if param.shape == model_state[name].shape:
                     filtered_state[name] = param

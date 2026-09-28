@@ -26,11 +26,22 @@ class GradNormCallback(Callback):
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", optimizer: Optimizer
     ) -> None:
         pl_module.log("train/gradient_norm", gradient_norm(pl_module))
+        for group in optimizer.param_groups:
+            name = group.get("name")
+            if name:
+                pl_module.log(
+                    f"train/gradient_norm_{name}",
+                    gradient_norm_from_parameters(group["params"]),
+                )
 
 
 def gradient_norm(model):
+    return gradient_norm_from_parameters(model.parameters())
+
+
+def gradient_norm_from_parameters(parameters):
     total_norm = 0.0
-    for p in model.parameters():
+    for p in parameters:
         if p.grad is not None:
             param_norm = p.grad.detach().data.norm(2)
             total_norm += param_norm.item() ** 2
