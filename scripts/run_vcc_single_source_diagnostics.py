@@ -53,11 +53,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="1", help="One physical GPU index")
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--sources", nargs="+", choices=tuple(SOURCES), default=list(SOURCES))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if "," in args.gpu or args.steps <= 0:
-        parser.error("Use exactly one GPU and a positive step count")
+    if "," in args.gpu or args.steps <= 0 or args.num_workers <= 0:
+        parser.error("Use exactly one GPU, positive steps and positive workers")
     for path in (PYTHON, CELL_EVAL, TARGETS, INIT):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -73,7 +74,8 @@ def main() -> None:
     summary = []
     for source in args.sources:
         manifest, data = SOURCES[source]
-        name = f"vcc_single_{source}_shared32_masked128_{args.steps}"
+        worker_suffix = f"_w{args.num_workers}" if args.num_workers != 2 else ""
+        name = f"vcc_single_{source}_shared32_masked128_{args.steps}{worker_suffix}"
         run_dir = ROOT / "runs" / name
         checkpoint = run_dir / "checkpoints/final.ckpt"
         prediction = run_dir / "shared32_train_prediction.h5ad"
@@ -89,7 +91,7 @@ def main() -> None:
                  "--model-config", "state_vcc_all_cross_batch_128", "--gpu", args.gpu,
                  "--init-from", str(INIT), "--max-steps", str(args.steps),
                  "--val-freq", "250", "--batch-size", "4",
-                 "--gradient-accumulation", "1", "--num-workers", "2"],
+                 "--gradient-accumulation", "1", "--num-workers", str(args.num_workers)],
                 ROOT / "logs" / f"{name}.log", env, dry_run=args.dry_run,
             )
         if not prediction.is_file() or not real.is_file():
@@ -120,7 +122,10 @@ def main() -> None:
             summary.append(result)
             print("RESULT " + " ".join(f"{key}={value}" for key, value in result.items()), flush=True)
     if summary:
-        summary_file = ROOT / "logs" / f"vcc_single_source_shared32_masked128_{args.steps}_summary.csv"
+        summary_file = ROOT / "logs" / (
+            f"vcc_single_source_shared32_masked128_{args.steps}"
+            f"{'_w' + str(args.num_workers) if args.num_workers != 2 else ''}_summary.csv"
+        )
         with summary_file.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(summary[0]))
             writer.writeheader()
