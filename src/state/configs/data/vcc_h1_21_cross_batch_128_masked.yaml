@@ -1,0 +1,9 @@
+defaults:
+  - vcc_h1_21_cross_batch
+  - _self_
+
+kwargs:
+  # Match the four-dataset Set=128 run while keeping the original H1-only
+  # manifest, perturbation focus, model, and optimizer settings unchanged.
+  pad_short_sets: true
+  min_cells_per_set: 16
