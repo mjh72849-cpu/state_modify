@@ -1,0 +1,9 @@
+[datasets]
+replogle_k562_gwps = "/sde/vcc/vcc2026/state/data/prepared/focused/replogle_k562_gwps.focused.xstate.h5ad"
+
+[training]
+replogle_k562_gwps = "train"
+
+[zeroshot]
+
+[fewshot]

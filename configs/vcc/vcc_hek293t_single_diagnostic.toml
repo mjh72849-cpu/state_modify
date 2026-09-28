@@ -1,0 +1,9 @@
+[datasets]
+xatlas_hek293t = "/sde/vcc/vcc2026/state/data/prepared/hek293t/xatlas_hek293t.focused.xstate.h5ad"
+
+[training]
+xatlas_hek293t = "train"
+
+[zeroshot]
+
+[fewshot]

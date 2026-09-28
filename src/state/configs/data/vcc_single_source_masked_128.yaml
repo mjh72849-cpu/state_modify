@@ -1,0 +1,8 @@
+defaults:
+  - vcc_all_cross_batch_128
+  - _self_
+
+kwargs:
+  # Identical model/data transforms to the current masked mixed run, but
+  # focus the sampler on 32 VCC targets present in all three source datasets.
+  focus_perturbations_file: assets/vcc_single_source_shared_32.txt

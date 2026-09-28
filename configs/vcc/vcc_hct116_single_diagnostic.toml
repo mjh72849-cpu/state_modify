@@ -1,0 +1,9 @@
+[datasets]
+xatlas_hct116 = "/sde/vcc/vcc2026/state/data/prepared/focused/xatlas_hct116.focused.xstate.h5ad"
+
+[training]
+xatlas_hct116 = "train"
+
+[zeroshot]
+
+[fewshot]
