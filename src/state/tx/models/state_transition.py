@@ -609,6 +609,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
         # forward pass + extract CLS last hidden state
+        cell_mask = batch.get("cell_mask")
+        if cell_mask is not None:
+            cell_mask = cell_mask.reshape(seq_input.shape[0], -1).to(
+                device=seq_input.device, dtype=torch.bool
+            )
+            if cell_mask.shape[1] != basal.shape[1] or not cell_mask.any(dim=1).all():
+                raise ValueError("cell_mask must be [B,S] with at least one real cell per Set")
+            if self.use_batch_token and self.batch_token is not None:
+                cell_mask = F.pad(cell_mask, (1, 0), value=True)
+            if self.confidence_token is not None:
+                cell_mask = F.pad(cell_mask, (0, 1), value=True)
         if self.hparams.get("mask_attn", False):
             batch_size, seq_length, _ = seq_input.shape
             device = seq_input.device
@@ -626,7 +637,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
             transformer_output = outputs.last_hidden_state
         else:
-            outputs = self.transformer_backbone(inputs_embeds=seq_input)
+            outputs = self.transformer_backbone(
+                inputs_embeds=seq_input, attention_mask=cell_mask
+            )
             transformer_output = outputs.last_hidden_state
 
         # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
@@ -683,8 +696,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
         else:
             return output
 
-    def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _compute_distribution_loss(
+        self, pred: torch.Tensor, target: torch.Tensor,
+        cell_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
+
+        if cell_mask is not None and not bool(cell_mask.all()):
+            return torch.stack([
+                self._compute_distribution_loss(p[m], t[m])
+                for p, t, m in zip(pred, target, cell_mask.bool())
+            ])
 
         if isinstance(self.loss_fn, SamplesLoss) and self.mmd_num_chunks > 1:
             feature_dim = pred.shape[-1]
@@ -702,6 +724,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         return self.loss_fn(pred, target)
 
     @staticmethod
+    def _masked_set_mean(values: torch.Tensor, cell_mask: torch.Tensor | None) -> torch.Tensor:
+        if cell_mask is None:
+            return values.mean(dim=1)
+        weights = cell_mask.to(device=values.device, dtype=values.dtype).unsqueeze(-1)
+        return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+
+    @staticmethod
     def _set_effect_losses(
         pred: torch.Tensor,
         target: torch.Tensor,
@@ -709,10 +738,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         perturbation_ids: torch.Tensor | None,
         *,
         temperature: float,
+        cell_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return cosine, log-magnitude and retrieval losses for set effects."""
-        pred_delta = pred.mean(dim=1) - basal.mean(dim=1)
-        true_delta = target.mean(dim=1) - basal.mean(dim=1)
+        pred_delta = (StateTransitionPerturbationModel._masked_set_mean(pred, cell_mask)
+                      - StateTransitionPerturbationModel._masked_set_mean(basal, cell_mask))
+        true_delta = (StateTransitionPerturbationModel._masked_set_mean(target, cell_mask)
+                      - StateTransitionPerturbationModel._masked_set_mean(basal, cell_mask))
         true_norm = true_delta.norm(dim=-1)
         valid = true_norm > 1e-8
         set_ids = None
@@ -769,6 +801,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         perturbation_ids: torch.Tensor | None,
         *,
         temperature: float,
+        cell_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Differentiable expression-space surrogate for the PDS ranking.
 
@@ -810,8 +843,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 row = list(gene_names[index])
                 names_by_set.append(row[:n_genes])
 
-        pred_profile = prediction.mean(dim=1)
-        target_profile = target.mean(dim=1)
+        pred_profile = StateTransitionPerturbationModel._masked_set_mean(prediction, cell_mask)
+        target_profile = StateTransitionPerturbationModel._masked_set_mean(target, cell_mask)
         similarity_rows = []
         usable = []
         for row_index, source_index in enumerate(active_indices):
@@ -879,6 +912,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         excluded_genes: set[str] | None = None,
         memory_bank: dict[str, dict[int, tuple[tuple[str, ...], torch.Tensor]]] | None = None,
         memory_bank_size: int = 0,
+        cell_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Rank matched perturbation effects on one feature axis per source.
 
@@ -899,6 +933,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         def pseudobulk(values: torch.Tensor, library_sizes: torch.Tensor) -> torch.Tensor:
             weights = library_sizes.reshape(batch_size, seq_len, 1).to(values)
+            if cell_mask is not None:
+                weights = weights * cell_mask.reshape(batch_size, seq_len, 1).to(weights)
             abundance = torch.expm1(values.float().clamp(min=0, max=12))
             weighted = (abundance * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
             return torch.log1p(weighted)
@@ -986,6 +1022,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         baseline: torch.Tensor,
         mask: torch.Tensor,
         perturbation_ids: torch.Tensor | None,
+        cell_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Cosine loss between predicted and true mean gene-expression deltas."""
         expanded_baseline = PanelFreeGeneDecoder._expand_gene_baseline(
@@ -993,8 +1030,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
             prediction,
             prediction.shape[-1],
         )
-        pred_delta = (prediction - expanded_baseline).mean(dim=1)
-        true_delta = (target - expanded_baseline).mean(dim=1)
+        pred_delta = StateTransitionPerturbationModel._masked_set_mean(
+            prediction - expanded_baseline, cell_mask
+        )
+        true_delta = StateTransitionPerturbationModel._masked_set_mean(
+            target - expanded_baseline, cell_mask
+        )
         set_mask = mask[:, 0, :].to(prediction.dtype)
         pred_delta = pred_delta * set_mask
         true_delta = true_delta * set_mask
@@ -1030,7 +1071,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # In PDS-only mode the latent loss remains a detached diagnostic; it
         # must not contribute a gradient or retain its reconstruction graph.
         loss_pred = pred.detach() if self.pds_only else pred
-        per_set_main_losses = self._compute_distribution_loss(loss_pred, target)
+        cell_mask = batch.get("cell_mask")
+        per_set_main_losses = self._compute_distribution_loss(loss_pred, target, cell_mask)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
 
@@ -1041,6 +1083,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             basal,
             batch.get("perturbation_ids"),
             temperature=self.latent_contrastive_temperature,
+            cell_mask=cell_mask,
         )
         self.log("train/latent_effect_cosine_loss", effect_cosine_loss)
         self.log("train/latent_effect_magnitude_loss", effect_magnitude_loss)
@@ -1172,12 +1215,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
                         batch["decoder_ctrl_library_sizes"], temperature=self.pds_temperature,
                         memory_bank=self._pds_memory_bank if self.pds_memory_bank_size else None,
                         memory_bank_size=self.pds_memory_bank_size,
+                        cell_mask=cell_mask,
                     )
                 else:
                     pds_surrogate_loss = self._panel_pds_retrieval_loss(
                         pert_cell_counts_preds, gene_targets, batch.get("gene_mask"),
                         batch.get("gene_names"), batch.get("perturbation_ids"),
                         temperature=self.pds_temperature,
+                        cell_mask=cell_mask,
                     )
                 self.log("train/pds_surrogate_loss", pds_surrogate_loss)
                 total_loss = total_loss + self.pds_loss_weight * pds_surrogate_loss
@@ -1192,6 +1237,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                     batch["gene_baselines"],
                     batch["gene_mask"].reshape_as(gene_targets),
                     batch.get("perturbation_ids"),
+                    cell_mask,
                 )
                 self.log("train/decoder_effect_cosine_loss", decoder_effect_loss)
                 total_loss = total_loss + self.decoder_effect_cosine_weight * decoder_effect_loss
@@ -1216,7 +1262,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
             delta = pred - ctrl_cell_emb
 
             # compute l1 loss
-            l1_loss = torch.abs(delta).mean()
+            if cell_mask is None:
+                l1_loss = torch.abs(delta).mean()
+            else:
+                weights = cell_mask.to(delta).unsqueeze(-1)
+                l1_loss = (torch.abs(delta) * weights).sum() / (
+                    weights.sum() * delta.shape[-1]
+                ).clamp_min(1)
 
             # Log the regularization loss
             self.log("train/l1_regularization", l1_loss)
@@ -1240,7 +1292,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
         loss_pred = pred.detach() if self.pds_only else pred
-        per_set_main_losses = self._compute_distribution_loss(loss_pred, target)
+        cell_mask = batch.get("cell_mask")
+        per_set_main_losses = self._compute_distribution_loss(loss_pred, target, cell_mask)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("val_loss", main_loss)
         loss = pred.sum() * 0.0 if self.pds_only else main_loss
@@ -1254,6 +1307,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             basal,
             batch.get("perturbation_ids"),
             temperature=self.latent_contrastive_temperature,
+            cell_mask=cell_mask,
         )
         self.log("val/latent_effect_cosine_loss", effect_cosine_loss, on_step=False, on_epoch=True)
         self.log("val/latent_effect_magnitude_loss", effect_magnitude_loss, on_step=False, on_epoch=True)
@@ -1265,8 +1319,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 + self.latent_effect_magnitude_weight * effect_magnitude_loss
                 + self.latent_contrastive_weight * contrastive_loss
             )
-        pred_delta = loss_pred.mean(dim=1) - basal.mean(dim=1)
-        true_delta = target.mean(dim=1) - basal.mean(dim=1)
+        pred_delta = self._masked_set_mean(loss_pred, cell_mask) - self._masked_set_mean(basal, cell_mask)
+        true_delta = self._masked_set_mean(target, cell_mask) - self._masked_set_mean(basal, cell_mask)
         true_norm = true_delta.norm(dim=-1)
         pred_norm = pred_delta.norm(dim=-1)
         valid_effect = true_norm > 1e-8
@@ -1329,12 +1383,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
                         batch["gene_mask"], batch["gene_names"], batch["perturbation_ids"],
                         batch["set_dataset_names"], batch["decoder_pert_library_sizes"],
                         batch["decoder_ctrl_library_sizes"], temperature=self.pds_temperature,
+                        cell_mask=cell_mask,
                     )
                 else:
                     pds_surrogate_loss = self._panel_pds_retrieval_loss(
                         pert_cell_counts_preds, gene_targets, batch.get("gene_mask"),
                         batch.get("gene_names"), batch.get("perturbation_ids"),
                         temperature=self.pds_temperature,
+                        cell_mask=cell_mask,
                     )
                 self.log("val/pds_surrogate_loss", pds_surrogate_loss, on_step=False, on_epoch=True)
                 loss = loss + self.pds_loss_weight * pds_surrogate_loss
@@ -1349,6 +1405,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                     batch["gene_baselines"],
                     batch["gene_mask"].reshape_as(gene_targets),
                     batch.get("perturbation_ids"),
+                    cell_mask,
                 )
                 self.log(
                     "val/decoder_effect_cosine_loss",

@@ -12,7 +12,7 @@ from cell_load.dataset import MetadataConcatDataset, PerturbationDataset
 from torch.utils.data import DataLoader
 
 from .data import canonical_gene_name, load_gene_name_list
-from .sampler import BalancedPerturbationBatchSampler
+from .sampler import BalancedPerturbationBatchSampler, MaskedCellDataset
 
 
 def _worker_init_fn(_worker_id: int) -> None:
@@ -50,6 +50,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         decoder_exclude_gene_names_file: str | None = None,
         group_batches_by_dataset: bool = False,
         set_group_by_batch: bool | None = None,
+        pad_short_sets: bool = False,
+        min_cells_per_set: int = 1,
         focus_perturbations_file: str | None = None,
         balance_datasets: bool = True,
         balance_perturbations: bool = True,
@@ -99,6 +101,10 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             kwargs.get("basal_mapping_strategy") == "batch"
             if set_group_by_batch is None else bool(set_group_by_batch)
         )
+        self.pad_short_sets = bool(pad_short_sets)
+        self.min_cells_per_set = int(min_cells_per_set)
+        if self.min_cells_per_set <= 0:
+            raise ValueError("min_cells_per_set must be positive")
         self.focus_perturbations_file = focus_perturbations_file
         self.focus_perturbations = (
             load_gene_name_list(focus_perturbations_file)
@@ -285,8 +291,15 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         set_dataset_names = []
         set_pert_library_sizes = []
         set_ctrl_library_sizes = []
+        set_cell_masks = []
         for start in range(0, len(samples), self.cell_sentence_len):
             set_samples = samples[start : start + self.cell_sentence_len]
+            cell_mask = torch.tensor(
+                [sample.get("_cell_valid", True) for sample in set_samples], dtype=torch.bool
+            )
+            if not cell_mask.any():
+                raise ValueError("A Set must contain at least one real cell")
+            set_cell_masks.append(cell_mask)
             dataset_names = {sample["dataset_name"] for sample in set_samples}
             if len(dataset_names) != 1:
                 raise ValueError(
@@ -475,7 +488,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
         ):
             width = targets.shape[-1]
             gene_targets[set_index, :, :width] = targets
-            gene_mask[set_index, :, :width] = True
+            gene_mask[set_index, :, :width] = set_cell_masks[set_index][:, None]
             gene_embeddings[set_index, :width] = embeddings
             gene_fallback_ids[set_index, :width] = fallback_ids
             if gene_baselines is not None:
@@ -490,6 +503,7 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                 "gene_fallback_ids": gene_fallback_ids,
                 "gene_targets": gene_targets,
                 "gene_mask": gene_mask,
+                "cell_mask": torch.stack(set_cell_masks),
                 "gene_names": padded_names,
                 "set_dataset_names": set_dataset_names,
                 "decoder_pert_library_sizes": torch.stack(set_pert_library_sizes),
@@ -538,10 +552,12 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
             control_perturbation=getattr(self, "control_pert", None),
             control_only_sets_per_epoch=self.control_only_sets_per_epoch,
             group_batches_by_dataset=self.group_batches_by_dataset and not test,
+            pad_short_sets=self.pad_short_sets,
+            min_cells_per_set=self.min_cells_per_set,
             focus_perturbations=self.focus_perturbations if not validation and not test else None,
         )
         return DataLoader(
-            dataset,
+            MaskedCellDataset(dataset) if self.pad_short_sets and not test else dataset,
             batch_sampler=sampler,
             num_workers=self.num_workers,
             collate_fn=self._panel_free_collate,
@@ -583,6 +599,8 @@ class PanelFreePerturbationDataModule(PerturbationDataModule):
                 "decoder_exclude_gene_names_file": getattr(self, "decoder_exclude_gene_names_file", None),
                 "group_batches_by_dataset": getattr(self, "group_batches_by_dataset", False),
                 "set_group_by_batch": getattr(self, "set_group_by_batch", None),
+                "pad_short_sets": getattr(self, "pad_short_sets", False),
+                "min_cells_per_set": getattr(self, "min_cells_per_set", 1),
                 "focus_perturbations_file": getattr(self, "focus_perturbations_file", None),
                 "decoder_fallback_gene_names": list(self.decoder_fallback_gene_to_id),
                 "trainable_perturbation_names_file": self.trainable_perturbation_names_file,

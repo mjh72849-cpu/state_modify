@@ -28,7 +28,7 @@ from state.tx.vcc import (
     VCCPredictionWriter,
     standardize_focus_metadata,
 )
-from state.tx.vcc.sampler import BalancedPerturbationBatchSampler
+from state.tx.vcc.sampler import BalancedPerturbationBatchSampler, MaskedCellDataset
 
 
 @pytest.mark.parametrize("use_write_only_handle", [False, True])
@@ -391,6 +391,39 @@ def test_balanced_sampler_caps_a_control_only_loco_dataset():
     train = [sentence for sentence in balanced if identities[sentence[0]][0] == "train"]
     assert len(held_out) == 2
     assert len(train) == 10
+
+
+def test_masked_short_set_preserves_unique_real_cells_and_marks_padding():
+    sampler = BalancedPerturbationBatchSampler.__new__(BalancedPerturbationBatchSampler)
+    sampler.sentences = [[0, 1, 2], [3, 4, 5, 6]]
+    sampler.cell_sentence_len = 5
+    sampler.batch_size = 2
+    sampler.group_batches_by_dataset = False
+    sampler.drop_last = False
+    sampler.distributed = False
+    sampler.seed = sampler.epoch = 0
+    marked = sampler._create_masked_batches()
+    assert len(marked) == 1
+    assert len(marked[0]) == 10
+    assert marked[0][:5] == [(0, True), (1, True), (2, True), (2, False), (2, False)]
+    assert marked[0][5:] == [(3, True), (4, True), (5, True), (6, True), (6, False)]
+
+    class Source:
+        def __init__(self):
+            self.reads = 0
+
+        def __len__(self):
+            return 7
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return {"index": index}
+
+    source = Source()
+    wrapped = MaskedCellDataset(source)
+    observed = [wrapped[key] for key in marked[0][:5]]
+    assert [sample["_cell_valid"] for sample in observed] == [True, True, True, False, False]
+    assert source.reads == 3
 
 
 def test_focus_metadata_adapter_unifies_context_and_control_fields():
@@ -844,6 +877,44 @@ def test_effect_pds_retrieval_uses_control_delta_and_ignores_duplicate_targets()
     assert torch.isfinite(good) and good < bad
     good.backward()
     assert prediction.grad is not None and prediction.grad.abs().sum() > 0
+
+
+def test_effect_pds_padding_has_no_loss_or_gradient_contribution():
+    control = torch.ones(2, 3, 4)
+    target = control.clone()
+    target[0, 0, 1] = 4.0
+    target[1, 0, 2] = 4.0
+    prediction = target.clone().requires_grad_()
+    cell_mask = torch.tensor([[True, False, False], [True, False, False]])
+    kwargs = dict(
+        control=control,
+        gene_mask=cell_mask[:, :, None].expand_as(target),
+        gene_names=[["A", "B", "C", "D"]] * 2,
+        perturbation_ids=torch.tensor([0, 0, 0, 1, 1, 1]),
+        dataset_names=["H1", "H1"],
+        pert_library_sizes=torch.full((2, 3), 1000.0),
+        ctrl_library_sizes=torch.full((2, 3), 1000.0),
+        temperature=0.1,
+        cell_mask=cell_mask,
+    )
+    loss = StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+        prediction, target, **kwargs
+    )
+    loss.backward()
+    assert prediction.grad is not None
+    assert prediction.grad[:, 1:].abs().sum() == 0
+    changed_prediction = prediction.detach().clone()
+    changed_prediction[:, 1:] = 9.0
+    changed_target = target.clone()
+    changed_target[:, 1:] = 7.0
+    changed_kwargs = dict(kwargs, control=control.clone())
+    changed_kwargs["control"][:, 1:] = 5.0
+    torch.testing.assert_close(
+        loss.detach(),
+        StateTransitionPerturbationModel._panel_pds_effect_retrieval_loss(
+            changed_prediction, changed_target, **changed_kwargs
+        ),
+    )
 
 
 def test_effect_pds_memory_bank_supplies_negatives_for_one_target_batches():

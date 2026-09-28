@@ -7,3 +7,7 @@ kwargs:
   # batches; basal controls remain matched by the native batch.
   set_group_by_batch: false
   sets_per_dataset_per_epoch: 1024
+  # Short perturbation groups (especially HEK293T) contribute each real cell
+  # once; duplicate slots are masked from attention and all supervised losses.
+  pad_short_sets: true
+  min_cells_per_set: 16
